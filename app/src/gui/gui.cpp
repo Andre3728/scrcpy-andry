@@ -36,7 +36,6 @@ constexpr Uint64 TOAST_DURATION_MS = 4000;
 constexpr Uint64 TOAST_ERROR_DURATION_MS = 7000;
 
 enum class Page { DEVICES, FILES, APPS, SETTINGS };
-enum class Appearance { SYSTEM, LIGHT, DARK };
 
 struct Palette {
     ImU32 window_bg;    // behind the mirror
@@ -171,7 +170,14 @@ struct sc_gui {
 
     float ui_scale = 0; // 0 means "not computed yet"
     bool dark = true;
-    Appearance appearance = Appearance::SYSTEM;
+    sc_gui_prefs prefs = {SC_GUI_APPEARANCE_SYSTEM, true, ""};
+    char adb_path_edit[512] = "";
+
+    // Settings: the profile currently applied, and the one being edited
+    sc_gui_profile profile_applied = {};
+    sc_gui_profile profile_edit = {};
+    std::string profile_title;
+    bool profile_known = false;
     Palette pal;
     ImFont *font_regular = nullptr;
     ImFont *font_semibold = nullptr;
@@ -267,6 +273,40 @@ notify_insets_changed(sc_gui *gui) {
 }
 
 void
+notify_prefs_changed(sc_gui *gui) {
+    sc_gui_prefs prefs = gui->prefs;
+    defer(gui, [gui, prefs] {
+        if (gui->cbs && gui->cbs->on_prefs_changed) {
+            gui->cbs->on_prefs_changed(&prefs, gui->cbs_userdata);
+        }
+    });
+}
+
+void
+notify_profile_changed(sc_gui *gui, bool restart) {
+    sc_gui_profile profile = gui->profile_applied;
+    defer(gui, [gui, profile, restart] {
+        if (gui->cbs && gui->cbs->on_profile_changed) {
+            gui->cbs->on_profile_changed(&profile, restart,
+                                         gui->cbs_userdata);
+        }
+    });
+}
+
+// Compare the settings which require a session restart
+bool
+restart_fields_equal(const sc_gui_profile &a, const sc_gui_profile &b) {
+    return a.max_size == b.max_size
+        && a.video_bit_rate == b.video_bit_rate
+        && a.max_fps == b.max_fps
+        && a.video_codec == b.video_codec
+        && a.audio == b.audio
+        && a.stay_awake == b.stay_awake
+        && a.show_touches == b.show_touches
+        && !strcmp(a.extra_args, b.extra_args);
+}
+
+void
 run_action(sc_gui *gui, sc_gui_action action) {
     defer(gui, [gui, action] {
         if (gui->cbs && gui->cbs->on_action) {
@@ -344,11 +384,11 @@ apply_style(sc_gui *gui) {
 void
 update_theme(sc_gui *gui) {
     bool dark;
-    switch (gui->appearance) {
-        case Appearance::LIGHT:
+    switch (gui->prefs.appearance) {
+        case SC_GUI_APPEARANCE_LIGHT:
             dark = false;
             break;
-        case Appearance::DARK:
+        case SC_GUI_APPEARANCE_DARK:
             dark = true;
             break;
         default:
@@ -640,6 +680,77 @@ segmented(sc_gui *gui, const char *id, const char *const *labels, int count,
     ImGui::PopID();
     ImGui::SetCursorScreenPos(pos + ImVec2(0, h));
     ImGui::Dummy(ImVec2(w, 0));
+    return changed;
+}
+
+// macOS-style toggle switch. Return true if the value changed.
+bool
+toggle_switch(sc_gui *gui, const char *id, bool *value) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    float h = gui->s(20);
+    float w = gui->s(34);
+    bool changed = false;
+    if (ImGui::InvisibleButton(id, ImVec2(w, h))) {
+        *value = !*value;
+        changed = true;
+    }
+    bool disabled = ImGui::GetItemFlags() & ImGuiItemFlags_Disabled;
+    ImU32 bg = *value ? gui->pal.accent
+                      : (gui->dark ? rgba(0xFFFFFF, 0.18f)
+                                   : rgba(0x000000, 0.14f));
+    if (disabled) {
+        bg &= 0x80FFFFFF;
+    }
+    dl->AddRectFilled(pos, pos + ImVec2(w, h), bg, h / 2);
+    float r = h / 2 - gui->s(2);
+    float cx = *value ? pos.x + w - h / 2 : pos.x + h / 2;
+    dl->AddCircleFilled(ImVec2(cx, pos.y + h / 2), r, rgba(0xFFFFFF));
+    return changed;
+}
+
+// Label on the left; the next widget is right-aligned with the given width
+void
+settings_row(sc_gui *gui, const char *label, bool restart,
+             float control_width) {
+    float avail = ImGui::GetContentRegionAvail().x;
+    float start_x = ImGui::GetCursorPosX();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(label);
+    if (restart) {
+        ImGui::SameLine(0, gui->s(4));
+        ImGui::PushFont(nullptr, 11.f);
+        text_colored(gui->pal.text_secondary, SC_ICON_ROTATE_CW);
+        ImGui::PopFont();
+        ImGui::SetItemTooltip("Applied when mirroring restarts");
+    }
+    ImGui::SameLine(start_x + avail - control_width);
+}
+
+// Popup button with a list of values. Return true if the value changed.
+template <typename T>
+bool
+popup_button(sc_gui *gui, const char *id, const char *const *labels,
+             const T *values, int count, T *value) {
+    int current = 0;
+    for (int i = 0; i < count; ++i) {
+        if (values[i] == *value) {
+            current = i;
+        }
+    }
+    bool changed = false;
+    ImGui::SetNextItemWidth(gui->s(120));
+    if (ImGui::BeginCombo(id, labels[current])) {
+        for (int i = 0; i < count; ++i) {
+            if (ImGui::Selectable(labels[i], i == current)) {
+                if (*value != values[i]) {
+                    *value = values[i];
+                    changed = true;
+                }
+            }
+        }
+        ImGui::EndCombo();
+    }
     return changed;
 }
 
@@ -981,17 +1092,151 @@ draw_page_apps(sc_gui *gui) {
               "Drag .apk files onto the device screen to install them.");
 }
 
+// A setting was edited
+void
+on_setting_edited(sc_gui *gui, bool live) {
+    if (!is_mirroring(gui) && gui->session != SC_GUI_SESSION_CONNECTING) {
+        // No session: everything is saved immediately
+        gui->profile_applied = gui->profile_edit;
+        notify_profile_changed(gui, false);
+    } else if (live) {
+        // Applied immediately, without restarting the session
+        gui->profile_applied.turn_screen_off =
+            gui->profile_edit.turn_screen_off;
+        notify_profile_changed(gui, false);
+    }
+}
+
+void
+draw_mirroring_settings(sc_gui *gui) {
+    sc_gui_profile &p = gui->profile_edit;
+
+    std::string header = "MIRRORING";
+    if (!gui->profile_title.empty()) {
+        header += " \xC2\xB7 " + gui->profile_title;
+    }
+    section_header(gui, header.c_str());
+
+    if (begin_card(gui, "##mirroring")) {
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(gui->s(8), gui->s(4)));
+
+        static const char *const size_labels[] = {
+            "Original", "2560", "1920", "1600", "1280", "1024", "800"};
+        static const uint16_t size_values[] = {
+            0, 2560, 1920, 1600, 1280, 1024, 800};
+        settings_row(gui, "Resolution", true, gui->s(120));
+        if (popup_button(gui, "##max_size", size_labels, size_values, 7,
+                         &p.max_size)) {
+            on_setting_edited(gui, false);
+        }
+
+        static const char *const rate_labels[] = {
+            "Default (8 Mbps)", "2 Mbps", "4 Mbps", "12 Mbps", "16 Mbps",
+            "24 Mbps", "32 Mbps"};
+        static const uint32_t rate_values[] = {
+            0, 2000000, 4000000, 12000000, 16000000, 24000000, 32000000};
+        settings_row(gui, "Video bitrate", true, gui->s(120));
+        if (popup_button(gui, "##bitrate", rate_labels, rate_values, 7,
+                         &p.video_bit_rate)) {
+            on_setting_edited(gui, false);
+        }
+
+        static const char *const fps_labels[] = {
+            "Unlimited", "30", "60", "90", "120"};
+        static const uint16_t fps_values[] = {0, 30, 60, 90, 120};
+        settings_row(gui, "Max frame rate", true, gui->s(120));
+        if (popup_button(gui, "##max_fps", fps_labels, fps_values, 5,
+                         &p.max_fps)) {
+            on_setting_edited(gui, false);
+        }
+
+        ImGui::PopStyleVar();
+
+        settings_row(gui, "Codec", true, 0);
+        ImGui::NewLine();
+        static const char *const codecs[] = {"H.264", "H.265", "AV1"};
+        int codec = (int) p.video_codec;
+        if (segmented(gui, "codec", codecs, 3, &codec)) {
+            p.video_codec = (sc_gui_codec) codec;
+            on_setting_edited(gui, false);
+        }
+        ImGui::Dummy(ImVec2(0, gui->s(2)));
+
+        float sw = gui->s(34);
+        settings_row(gui, "Audio", true, sw);
+        if (toggle_switch(gui, "##audio", &p.audio)) {
+            on_setting_edited(gui, false);
+        }
+        settings_row(gui, "Stay awake", true, sw);
+        if (toggle_switch(gui, "##stay_awake", &p.stay_awake)) {
+            on_setting_edited(gui, false);
+        }
+        ImGui::SetItemTooltip("Keep the device awake while plugged in");
+        settings_row(gui, "Show touches", true, sw);
+        if (toggle_switch(gui, "##show_touches", &p.show_touches)) {
+            on_setting_edited(gui, false);
+        }
+        settings_row(gui, "Turn screen off", false, sw);
+        if (toggle_switch(gui, "##screen_off", &p.turn_screen_off)) {
+            on_setting_edited(gui, true);
+        }
+        ImGui::SetItemTooltip("Turn the device screen off while mirroring");
+
+        ImGui::Dummy(ImVec2(0, gui->s(2)));
+        settings_row(gui, "Additional arguments", true, 0);
+        ImGui::NewLine();
+        input_text(gui, "##extra_args", "e.g. --crop=1080:1920:0:0",
+                   p.extra_args, sizeof(p.extra_args));
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            on_setting_edited(gui, false);
+        }
+    }
+    end_card();
+
+    bool session = gui->session != SC_GUI_SESSION_NONE;
+    if (session
+            && !restart_fields_equal(gui->profile_edit,
+                                     gui->profile_applied)) {
+        ImGui::Dummy(ImVec2(0, gui->s(2)));
+        if (push_button(gui, SC_ICON_ROTATE_CW " Apply & restart", true)) {
+            bool screen_off = gui->profile_applied.turn_screen_off;
+            gui->profile_applied = gui->profile_edit;
+            gui->profile_applied.turn_screen_off = screen_off;
+            notify_profile_changed(gui, true);
+        }
+        ImGui::SameLine();
+        if (push_button(gui, "Revert")) {
+            bool screen_off = gui->profile_edit.turn_screen_off;
+            gui->profile_edit = gui->profile_applied;
+            gui->profile_edit.turn_screen_off = screen_off;
+        }
+    } else {
+        text_wrapped_colored(gui->pal.text_secondary,
+                             session ? "Settings marked " SC_ICON_ROTATE_CW
+                                       " restart mirroring when applied."
+                                     : "Saved for this device. Used the next "
+                                       "time it is mirrored.");
+    }
+}
+
 void
 draw_page_settings(sc_gui *gui) {
     page_title(gui, "Settings");
 
+    if (gui->profile_known) {
+        draw_mirroring_settings(gui);
+        ImGui::Dummy(ImVec2(0, gui->s(6)));
+    }
+
     section_header(gui, "APPEARANCE");
     if (begin_card(gui, "##appearance")) {
         static const char *const labels[] = {"System", "Light", "Dark"};
-        int sel = (int) gui->appearance;
+        int sel = (int) gui->prefs.appearance;
         if (segmented(gui, "appearance", labels, 3, &sel)) {
-            gui->appearance = (Appearance) sel;
+            gui->prefs.appearance = (sc_gui_appearance) sel;
             update_theme(gui);
+            notify_prefs_changed(gui);
         }
     }
     end_card();
@@ -1006,6 +1251,29 @@ draw_page_settings(sc_gui *gui) {
                              "Click the device screen to type on the device. "
                              "Click anywhere else to release the keyboard. "
                              "Shortcuts (Alt+...) always work.");
+    }
+    end_card();
+
+    ImGui::Dummy(ImVec2(0, gui->s(6)));
+    section_header(gui, "ADVANCED");
+    if (begin_card(gui, "##advanced")) {
+        ImGui::TextUnformatted("adb executable");
+        input_text(gui, "##adb_path", "Default (bundled or PATH)",
+                   gui->adb_path_edit, sizeof(gui->adb_path_edit));
+        bool changed = strcmp(gui->adb_path_edit, gui->prefs.adb_path);
+        ImGui::BeginDisabled(!changed);
+        if (push_button(gui, "Save")) {
+            memcpy(gui->prefs.adb_path, gui->adb_path_edit,
+                   sizeof(gui->prefs.adb_path));
+            notify_prefs_changed(gui);
+            add_toast(gui, SC_GUI_TOAST_INFO,
+                      "Restart scrcpy-gui to use the new adb executable.");
+        }
+        ImGui::EndDisabled();
+        text_wrapped_colored(gui->pal.text_secondary,
+                             "Use the same adb as Android Studio to avoid "
+                             "conflicts between adb versions. The ADB "
+                             "environment variable takes precedence.");
     }
     end_card();
 }
@@ -1146,7 +1414,9 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
                        gui->sidebar_visible ? "Hide sidebar" : "Show sidebar",
                        gui->sidebar_visible)) {
         gui->sidebar_visible = !gui->sidebar_visible;
+        gui->prefs.sidebar_visible = gui->sidebar_visible;
         notify_insets_changed(gui);
+        notify_prefs_changed(gui);
     }
     ImGui::SameLine();
     toolbar_separator(gui);
@@ -1646,6 +1916,29 @@ void
 sc_gui_show_toast(struct sc_gui *gui, enum sc_gui_toast_level level,
                   const char *text) {
     add_toast(gui, level, text);
+    request_redraw(gui);
+}
+
+void
+sc_gui_set_profile(struct sc_gui *gui, const struct sc_gui_profile *profile,
+                   const char *title) {
+    gui->profile_applied = *profile;
+    gui->profile_edit = *profile;
+    gui->profile_title = title ? title : "";
+    gui->profile_known = true;
+    request_redraw(gui);
+}
+
+void
+sc_gui_set_prefs(struct sc_gui *gui, const struct sc_gui_prefs *prefs) {
+    bool sidebar_changed = gui->sidebar_visible != prefs->sidebar_visible;
+    gui->prefs = *prefs;
+    memcpy(gui->adb_path_edit, prefs->adb_path, sizeof(gui->adb_path_edit));
+    gui->sidebar_visible = prefs->sidebar_visible;
+    update_theme(gui);
+    if (sidebar_changed) {
+        notify_insets_changed(gui);
+    }
     request_redraw(gui);
 }
 

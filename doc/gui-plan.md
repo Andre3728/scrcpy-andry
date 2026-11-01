@@ -233,6 +233,27 @@ Each milestone is usable and mergeable on its own.
   on Windows); the screen removes its event watcher on destroy.
 - Not verified yet (needs hands-on): Stop/Mirror buttons, Use Wi-Fi, pairing.
 
+### M3 — Settings (implemented)
+
+- `app/src/gui_config.c`: `config.json` in the user config directory
+  (`%APPDATA%\scrcpy-gui\` on Windows, via `SDL_GetPrefPath`), cJSON
+  v1.7.19 vendored in `app/src/gui/third_party/cjson/`. Stores appearance,
+  sidebar visibility, adb path, last device, default profile and per-device
+  profiles. Written atomically (temp file + rename).
+- Settings page: Resolution, Video bitrate, Max frame rate, Codec, Audio,
+  Stay awake, Show touches (all ↻), Turn screen off (live), Additional
+  arguments (↻, parsed with the scrcpy CLI parser on top of the profile).
+  While mirroring, ↻ changes show "Apply & restart" / "Revert"; without a
+  session, changes are saved for the next session (to the defaults when no
+  device is mirrored).
+- Deviation from the plan: Stay awake and Show touches are ↻ (restart)
+  rather than live, because the server sets and restores them itself.
+- adb path override (Settings > Advanced), applied at the next launch; the
+  `ADB` environment variable wins. Version mismatch warning: not done.
+- Unit test `test_gui_config` (JSON round-trip, invalid values, argument
+  splitting). Verified on device: a profile with max size 800 and
+  `--no-audio --max-fps=30` gives a 384x800 stream without audio.
+
 
 ## Build and test
 

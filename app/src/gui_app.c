@@ -13,8 +13,10 @@
 
 #include "adb/adb.h"
 #include "adb/adb_device.h"
+#include "cli.h"
 #include "events.h"
 #include "gui/gui.h"
+#include "gui_config.h"
 #include "icon.h"
 #include "screen.h"
 #include "sdl_hints.h"
@@ -22,6 +24,7 @@
 #include "util/intr.h"
 #include "util/log.h"
 #include "util/sdl.h"
+#include "util/str.h"
 #include "util/thread.h"
 #include "util/tick.h"
 
@@ -50,7 +53,12 @@ struct sc_gui_task {
 };
 
 struct sc_gui_app {
+    // Options from the command line, the base for every session
     struct scrcpy_options *options;
+    // Options of the current session (base + device profile)
+    struct scrcpy_options session_options;
+
+    struct sc_gui_config config;
 
     SDL_Window *window;
     SDL_Renderer *renderer;
@@ -102,6 +110,21 @@ str_eq(const char *a, const char *b) {
     return a && b && !strcmp(a, b);
 }
 
+// Take ownership of s until exit
+static bool
+keep_owned(struct sc_gui_app *app, char *s) {
+    char **list = realloc(app->kept_strings,
+                          (app->kept_count + 1) * sizeof(*list));
+    if (!list) {
+        LOG_OOM();
+        free(s);
+        return false;
+    }
+    list[app->kept_count++] = s;
+    app->kept_strings = list;
+    return true;
+}
+
 static const char *
 keep_string(struct sc_gui_app *app, const char *s) {
     char *dup = strdup(s);
@@ -109,16 +132,56 @@ keep_string(struct sc_gui_app *app, const char *s) {
         LOG_OOM();
         return NULL;
     }
-    char **list = realloc(app->kept_strings,
-                          (app->kept_count + 1) * sizeof(*list));
-    if (!list) {
-        LOG_OOM();
-        free(dup);
-        return NULL;
+    return keep_owned(app, dup) ? dup : NULL;
+}
+
+static void
+save_config(struct sc_gui_app *app) {
+    sc_gui_config_save(&app->config);
+}
+
+// Parse the "additional arguments" of a profile on top of the options
+static bool
+apply_extra_args(struct sc_gui_app *app, const char *extra,
+                 struct scrcpy_options *options) {
+#define SC_GUI_MAX_EXTRA_ARGS 64
+    char *argv[SC_GUI_MAX_EXTRA_ARGS + 2];
+    argv[0] = "scrcpy-gui";
+    int count = sc_gui_split_args(extra, &argv[1], SC_GUI_MAX_EXTRA_ARGS);
+    if (count < 0) {
+        LOGE("Invalid additional arguments: %s", extra);
+        return false;
     }
-    list[app->kept_count++] = dup;
-    app->kept_strings = list;
-    return dup;
+    argv[count + 1] = NULL;
+
+    // The options may reference the argument strings: keep them until exit
+    for (int i = 1; i <= count; ++i) {
+        if (!keep_owned(app, argv[i])) {
+            // argv[i] is freed, and the next ones must be too
+            for (int j = i + 1; j <= count; ++j) {
+                free(argv[j]);
+            }
+            return false;
+        }
+    }
+
+    struct scrcpy_cli_args args = {
+        .opts = *options,
+        .help = false,
+        .version = false,
+        .pause_on_exit = SC_PAUSE_ON_EXIT_FALSE,
+    };
+    // The serial is selected by the GUI
+    args.opts.serial = NULL;
+    if (!scrcpy_parse_args(&args, count + 1, argv)) {
+        LOGE("Invalid additional arguments: %s", extra);
+        return false;
+    }
+    if (args.help || args.version) {
+        return false;
+    }
+    *options = args.opts;
+    return true;
 }
 
 // ------------------------------------------------------------------- worker
@@ -625,6 +688,40 @@ cb_on_disconnect(const char *address, void *userdata) {
     submit_task(app, SC_GUI_TASK_DISCONNECT, NULL, address, NULL);
 }
 
+static void
+cb_on_profile_changed(const struct sc_gui_profile *profile, bool restart,
+                      void *userdata) {
+    struct sc_gui_app *app = userdata;
+    const char *serial = app->session_serial;
+
+    bool was_screen_off =
+        sc_gui_config_get_profile(&app->config, serial)->turn_screen_off;
+    sc_gui_config_set_profile(&app->config, serial, profile);
+    save_config(app);
+
+    if (app->screen && profile->turn_screen_off != was_screen_off) {
+        sc_screen_handle_gui_action(app->screen, profile->turn_screen_off
+                                                     ? SC_GUI_ACTION_SCREEN_OFF
+                                                     : SC_GUI_ACTION_SCREEN_ON);
+    }
+
+    if (restart && serial) {
+        // Restart the session on the same device
+        char *copy = strdup(serial);
+        if (copy) {
+            cb_on_start_session(copy, app);
+            free(copy);
+        }
+    }
+}
+
+static void
+cb_on_prefs_changed(const struct sc_gui_prefs *prefs, void *userdata) {
+    struct sc_gui_app *app = userdata;
+    app->config.prefs = *prefs;
+    save_config(app);
+}
+
 // ------------------------------------------------------------ session host
 
 static bool
@@ -649,7 +746,7 @@ host_on_screen(struct sc_screen *screen, void *userdata) {
         sc_gui_set_session(app->gui, SC_GUI_SESSION_RUNNING,
                            app->session_serial,
                            device_name(app, app->session_serial),
-                           app->options->control);
+                           app->session_options.control);
     }
 }
 
@@ -684,19 +781,39 @@ run_session(struct sc_gui_app *app) {
         .quit_requested = false,
     };
 
-    struct scrcpy_options *options = app->options;
-    const char *cli_serial = options->serial;
+    // Options for this session: command line + device profile
+    const struct sc_gui_profile *profile =
+        sc_gui_config_get_profile(&app->config, kept);
+    sc_gui_set_profile(app->gui, profile, name);
+
+    struct scrcpy_options *options = &app->session_options;
+    *options = *app->options;
+    sc_gui_profile_apply(profile, options);
+    if (*profile->extra_args) {
+        struct scrcpy_options with_extra = *options;
+        if (apply_extra_args(app, profile->extra_args, &with_extra)) {
+            *options = with_extra;
+        } else {
+            sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR,
+                              "Invalid additional arguments (ignored). See "
+                              "Settings > Additional arguments.");
+        }
+    }
     options->serial = kept;
+    options->window = true;
+
+    sc_strncpy(app->config.last_serial, kept, sizeof(app->config.last_serial));
+    save_config(app);
 
     LOGI("Starting mirroring session: %s", kept);
     sc_main_thread_resume();
     enum scrcpy_exit_code ret = scrcpy_run(options, &host);
 
-    options->serial = cli_serial;
     app->screen = NULL;
     app->session_serial = NULL;
     app->insets = sc_gui_get_insets(app->gui);
     sc_gui_set_session(app->gui, SC_GUI_SESSION_NONE, NULL, NULL, false);
+    sc_gui_set_profile(app->gui, &app->config.defaults, "Default");
 
     if (host.quit_requested) {
         app->quit = true;
@@ -847,6 +964,18 @@ scrcpy_gui(struct scrcpy_options *options) {
 
     sc_sdl_set_hints(options->render_driver, options->disable_screensaver);
 
+    sc_gui_config_init(&app->config);
+    sc_gui_config_load(&app->config);
+
+    // adb path from the settings (the ADB environment variable wins)
+    if (*app->config.prefs.adb_path && !SDL_getenv("ADB")) {
+#ifdef _WIN32
+        _putenv_s("ADB", app->config.prefs.adb_path);
+#else
+        setenv("ADB", app->config.prefs.adb_path, 0);
+#endif
+    }
+
     if (!sc_adb_init()) {
         return SCRCPY_EXIT_FAILURE;
     }
@@ -864,6 +993,8 @@ scrcpy_gui(struct scrcpy_options *options) {
         .on_pair = cb_on_pair,
         .on_connect = cb_on_connect,
         .on_disconnect = cb_on_disconnect,
+        .on_profile_changed = cb_on_profile_changed,
+        .on_prefs_changed = cb_on_prefs_changed,
     };
     struct sc_gui_params gui_params = {
         .window = app->window,
@@ -897,6 +1028,9 @@ scrcpy_gui(struct scrcpy_options *options) {
 #if defined(__APPLE__) || defined(_WIN32)
     SDL_AddEventWatch(resize_watcher, app);
 #endif
+
+    sc_gui_set_prefs(app->gui, &app->config.prefs);
+    sc_gui_set_profile(app->gui, &app->config.defaults, "Default");
 
     show_window(app);
 
@@ -955,6 +1089,7 @@ end_window:
 end_adb:
     sc_adb_destroy();
 
+    sc_gui_config_destroy(&app->config);
     sc_adb_devices_destroy(&app->devices);
     free(app->start_serial);
     free(app->reconnect_serial);

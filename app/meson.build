@@ -21,6 +21,7 @@ src = [
     'src/fps_counter.c',
     'src/frame_buffer.c',
     'src/gui_app.c',
+    'src/gui_config.c',
     'src/hwdec.c',
     'src/icon.c',
     'src/input_manager.c',
@@ -251,6 +252,10 @@ imgui_lib = static_library('imgui',
     dependencies: dependency('sdl3', version: '>= 3.2.0', static: static),
     override_options: ['cpp_std=c++17', 'warning_level=0'])
 
+cjson_lib = static_library('cjson',
+    'src/gui/third_party/cjson/cJSON.c',
+    override_options: ['warning_level=0'])
+
 python = import('python').find_installation()
 gui_fonts_h = custom_target('gui_fonts.h',
     output: 'gui_fonts.h',
@@ -276,7 +281,7 @@ gui_lib = static_library('gui',
 executable('scrcpy-gui', src,
            dependencies: dependencies,
            include_directories: src_dir,
-           link_with: gui_lib,
+           link_with: [gui_lib, cjson_lib],
            install: true,
            c_args: [])
 
@@ -379,6 +384,22 @@ if get_option('buildtype') == 'debug'
                          c_args: ['-DSC_TEST'])
         test(t[0], exe)
     endforeach
+
+    # scrcpy-gui
+    test_gui_config = executable('test_gui_config', [
+            'tests/test_gui_config.c',
+            'src/gui_config.c',
+            'src/compat.c',
+            'src/util/log.c',
+            'src/util/str.c',
+            'src/util/strbuf.c',
+            'src/util/term.c',
+        ],
+        include_directories: src_dir,
+        dependencies: dependencies,
+        link_with: cjson_lib,
+        c_args: ['-DSC_TEST'])
+    test('test_gui_config', test_gui_config)
 endif
 
 if meson.version().version_compare('>= 0.58.0')

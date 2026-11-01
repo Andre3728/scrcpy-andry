@@ -47,6 +47,38 @@ enum sc_gui_action {
     SC_GUI_ACTION_SCREEN_ON,
 };
 
+enum sc_gui_codec {
+    SC_GUI_CODEC_H264,
+    SC_GUI_CODEC_H265,
+    SC_GUI_CODEC_AV1,
+};
+
+// Mirroring settings, per device (or defaults)
+struct sc_gui_profile {
+    uint16_t max_size;       // 0: original resolution
+    uint32_t video_bit_rate; // bps, 0: default
+    uint16_t max_fps;        // 0: unlimited
+    enum sc_gui_codec video_codec;
+    bool audio;
+    bool stay_awake;
+    bool turn_screen_off;    // applied live
+    bool show_touches;
+    char extra_args[256];    // additional scrcpy arguments
+};
+
+enum sc_gui_appearance {
+    SC_GUI_APPEARANCE_SYSTEM,
+    SC_GUI_APPEARANCE_LIGHT,
+    SC_GUI_APPEARANCE_DARK,
+};
+
+// Application preferences
+struct sc_gui_prefs {
+    enum sc_gui_appearance appearance;
+    bool sidebar_visible;
+    char adb_path[512]; // empty: default
+};
+
 struct sc_gui_callbacks {
     // A toolbar/menu action was triggered (only while mirroring)
     void (*on_action)(enum sc_gui_action action, void *userdata);
@@ -60,6 +92,13 @@ struct sc_gui_callbacks {
     void (*on_pair)(const char *address, const char *code, void *userdata);
     void (*on_connect)(const char *address, void *userdata);
     void (*on_disconnect)(const char *address, void *userdata);
+
+    // Settings. restart is true if the session must be restarted to apply
+    // the profile.
+    void (*on_profile_changed)(const struct sc_gui_profile *profile,
+                               bool restart, void *userdata);
+    void (*on_prefs_changed)(const struct sc_gui_prefs *prefs,
+                             void *userdata);
 };
 
 struct sc_gui_params {
@@ -149,6 +188,16 @@ sc_gui_set_session(struct sc_gui *gui, enum sc_gui_session_state state,
 void
 sc_gui_show_toast(struct sc_gui *gui, enum sc_gui_toast_level level,
                   const char *text);
+
+// Set the profile shown in Settings, with a title such as the device name
+// (the data is copied)
+void
+sc_gui_set_profile(struct sc_gui *gui, const struct sc_gui_profile *profile,
+                   const char *title);
+
+// Set the application preferences (the data is copied)
+void
+sc_gui_set_prefs(struct sc_gui *gui, const struct sc_gui_prefs *prefs);
 
 // Indicate that a background device task (Wi-Fi switch, pairing...) is running
 void
