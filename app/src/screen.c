@@ -611,6 +611,76 @@ update_window_minimum_size(struct sc_screen *screen) {
     }
 }
 
+SDL_Surface *
+sc_screen_capture(struct sc_screen *screen) {
+    if (!screen->video || screen->is_icon_active) {
+        return NULL;
+    }
+    SDL_Texture *texture = sc_texture_get(&screen->tex);
+    if (!texture) {
+        return NULL;
+    }
+
+    struct sc_size frame_size = sc_texture_get_frame_size(&screen->tex);
+    struct sc_size content_size = screen->content_size;
+    if (!frame_size.width || !frame_size.height || !content_size.width
+            || !content_size.height) {
+        return NULL;
+    }
+
+    SDL_Renderer *renderer = screen->renderer;
+    SDL_Texture *target =
+        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ABGR8888,
+                          SDL_TEXTUREACCESS_TARGET, content_size.width,
+                          content_size.height);
+    if (!target) {
+        LOGE("Could not create capture texture: %s", SDL_GetError());
+        return NULL;
+    }
+
+    SDL_Texture *previous_target = SDL_GetRenderTarget(renderer);
+    SDL_Surface *surface = NULL;
+    if (!SDL_SetRenderTarget(renderer, target)) {
+        LOGE("Could not set capture target: %s", SDL_GetError());
+        goto end;
+    }
+
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 0xFF);
+    SDL_RenderClear(renderer);
+
+    SDL_FRect src = {0, 0, frame_size.width, frame_size.height};
+    enum sc_orientation orientation = screen->orientation;
+    unsigned cw_rotation = sc_orientation_get_rotation(orientation);
+    SDL_FRect dst;
+    if (sc_orientation_is_swap(orientation)) {
+        // The texture is drawn rotated around its center
+        dst.w = content_size.height;
+        dst.h = content_size.width;
+        dst.x = (content_size.width - dst.w) / 2.f;
+        dst.y = (content_size.height - dst.h) / 2.f;
+    } else {
+        dst.x = 0;
+        dst.y = 0;
+        dst.w = content_size.width;
+        dst.h = content_size.height;
+    }
+    SDL_FlipMode flip = sc_orientation_is_mirror(orientation)
+                      ? SDL_FLIP_HORIZONTAL : 0;
+    bool ok = SDL_RenderTextureRotated(renderer, texture, &src, &dst,
+                                       90.0 * cw_rotation, NULL, flip);
+    if (ok) {
+        surface = SDL_RenderReadPixels(renderer, NULL);
+    }
+    if (!surface) {
+        LOGE("Could not capture the frame: %s", SDL_GetError());
+    }
+
+end:
+    SDL_SetRenderTarget(renderer, previous_target);
+    SDL_DestroyTexture(target);
+    return surface;
+}
+
 void
 sc_screen_handle_gui_action(struct sc_screen *screen,
                             enum sc_gui_action action) {

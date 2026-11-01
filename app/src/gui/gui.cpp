@@ -26,11 +26,11 @@ constexpr float TOOLBAR_HEIGHT = 60.f;
 constexpr float FONT_SIZE = 14.f;
 constexpr float TITLE_FONT_SIZE = 20.f;
 constexpr float ICON_FONT_SIZE = 17.f;
-constexpr float TOOLBAR_BUTTON_SIZE = 36.f;
+constexpr float TOOLBAR_BUTTON_SIZE = 32.f;
 constexpr float DEFAULT_AREA_WIDTH = 420.f;
 constexpr float DEFAULT_AREA_HEIGHT = 760.f;
 
-constexpr int TOOLBAR_BUTTONS = 10;
+constexpr int TOOLBAR_BUTTONS = 12;
 constexpr int TOOLBAR_SEPARATORS = 3;
 
 constexpr Uint64 TOAST_DURATION_MS = 4000;
@@ -246,6 +246,11 @@ struct sc_gui {
     // Destination folder under the cursor during a drag (file manager), or
     // empty for the default behavior
     std::string drop_target_dir;
+
+    // Capture
+    bool recording = false;
+    Uint64 recording_start = 0;
+    Uint64 flash_until = 0;
 
     std::vector<Transfer> transfers; // oldest first
     bool open_transfers = false;
@@ -893,8 +898,19 @@ draw_nav(sc_gui *gui, float height) {
     switch (gui->session) {
         case SC_GUI_SESSION_RUNNING:
             text_semibold(gui, gui->session_name.c_str());
-            status_dot(gui, gui->pal.success);
-            text_colored(gui->pal.text_secondary, "Connected");
+            if (gui->recording) {
+                Uint64 secs = (SDL_GetTicks() - gui->recording_start) / 1000;
+                char rec[32];
+                snprintf(rec, sizeof(rec), "Recording %02u:%02u",
+                         (unsigned) (secs / 60), (unsigned) (secs % 60));
+                // Blink the dot every second
+                status_dot(gui, secs % 2 ? gui->pal.error
+                                         : (gui->pal.error & 0x60FFFFFF));
+                text_colored(gui->pal.error, rec);
+            } else {
+                status_dot(gui, gui->pal.success);
+                text_colored(gui->pal.text_secondary, "Connected");
+            }
             break;
         case SC_GUI_SESSION_CONNECTING:
             text_semibold(gui, gui->session_name.c_str());
@@ -2333,8 +2349,10 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
         run_action(gui, SC_GUI_ACTION_APP_SWITCH);
     }
     ImGui::SameLine();
+    ImGui::EndDisabled();
     toolbar_separator(gui);
     ImGui::SameLine();
+    ImGui::BeginDisabled(!is_mirroring(gui) || !gui->control);
     if (toolbar_button(gui, "##voldown", SC_ICON_VOLUME_1, "Volume down")) {
         run_action(gui, SC_GUI_ACTION_VOLUME_DOWN);
     }
@@ -2342,8 +2360,6 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     if (toolbar_button(gui, "##volup", SC_ICON_VOLUME_2, "Volume up")) {
         run_action(gui, SC_GUI_ACTION_VOLUME_UP);
     }
-    ImGui::SameLine();
-    toolbar_separator(gui);
     ImGui::SameLine();
     if (toolbar_button(gui, "##power", SC_ICON_POWER, "Power")) {
         run_action(gui, SC_GUI_ACTION_POWER);
@@ -2354,6 +2370,41 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     }
     ImGui::SameLine();
     ImGui::EndDisabled();
+    toolbar_separator(gui);
+    ImGui::SameLine();
+
+    // Capture (no control needed)
+    ImGui::BeginDisabled(!is_mirroring(gui));
+    if (toolbar_button(gui, "##screenshot", SC_ICON_CAMERA,
+                       "Screenshot (saved to Pictures, copied to the "
+                       "clipboard)")) {
+        defer(gui, [gui] {
+            if (gui->cbs && gui->cbs->on_screenshot) {
+                gui->cbs->on_screenshot(gui->cbs_userdata);
+            }
+        });
+    }
+    ImGui::SameLine();
+    ImVec2 rec_pos = ImGui::GetCursorScreenPos();
+    if (toolbar_button(gui, "##record", SC_ICON_CIRCLE_DOT,
+                       gui->recording
+                           ? "Stop recording (mirroring restarts)"
+                           : "Record (saved to Videos; mirroring restarts)",
+                       gui->recording)) {
+        defer(gui, [gui] {
+            if (gui->cbs && gui->cbs->on_toggle_recording) {
+                gui->cbs->on_toggle_recording(gui->cbs_userdata);
+            }
+        });
+    }
+    if (gui->recording) {
+        // Red record icon
+        ImDrawList *rdl = ImGui::GetWindowDrawList();
+        ImVec2 c = rec_pos + ImVec2(button / 2, button / 2);
+        rdl->AddCircleFilled(c, gui->s(5), gui->pal.error);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
 
     // Transfers (enabled even without a session, to see the history)
     int active = 0;
@@ -2504,6 +2555,19 @@ draw_toasts(sc_gui *gui, float right) {
 }
 
 void
+draw_flash(sc_gui *gui, const SDL_FRect *rect) {
+    Uint64 now = SDL_GetTicks();
+    if (!rect || now >= gui->flash_until) {
+        return;
+    }
+    float alpha = (float) (gui->flash_until - now) / 250.f;
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(ImVec2(rect->x, rect->y),
+                      ImVec2(rect->x + rect->w, rect->y + rect->h),
+                      rgba(0xFFFFFF, 0.7f * alpha));
+}
+
+void
 draw_focus_ring(sc_gui *gui, const SDL_FRect *rect) {
     if (!rect || !gui->mirror_focused) {
         return;
@@ -2531,6 +2595,8 @@ schedule_timer(sc_gui *gui) {
                || gui->session == SC_GUI_SESSION_CONNECTING
                || gui->task_busy
                || !gui->devices_known
+               || gui->recording
+               || SDL_GetTicks() < gui->flash_until
                || std::any_of(gui->transfers.begin(), gui->transfers.end(),
                               [](const Transfer &t) { return t.active(); });
     if (!needed || SDL_GetAtomicInt(&gui->timer_pending)) {
@@ -2820,6 +2886,7 @@ sc_gui_render(struct sc_gui *gui, const SDL_FRect *mirror_rect) {
         }
         draw_toolbar(gui, insets.left, display.x - insets.left, display.y);
         draw_focus_ring(gui, mirror_rect);
+        draw_flash(gui, mirror_rect);
         draw_drop_overlay(gui, insets.left, display.x - insets.left,
                           display.y);
     }
@@ -2963,6 +3030,21 @@ sc_gui_set_listing(struct sc_gui *gui, const char *path,
     }
     gui->files_selected.swap(selected);
     files_sort(gui);
+    request_redraw(gui);
+}
+
+void
+sc_gui_set_recording(struct sc_gui *gui, bool recording) {
+    if (recording && !gui->recording) {
+        gui->recording_start = SDL_GetTicks();
+    }
+    gui->recording = recording;
+    request_redraw(gui);
+}
+
+void
+sc_gui_flash(struct sc_gui *gui) {
+    gui->flash_until = SDL_GetTicks() + 250;
     request_redraw(gui);
 }
 

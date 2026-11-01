@@ -153,6 +153,10 @@ struct sc_gui_callbacks {
     // folder chosen by the user
     void (*on_pull_files)(const char *const *paths, size_t count,
                           bool choose_folder, void *userdata);
+
+    // Capture
+    void (*on_screenshot)(void *userdata);
+    void (*on_toggle_recording)(void *userdata);
 };
 
 struct sc_gui_params {
@@ -269,6 +273,14 @@ sc_gui_set_listing(struct sc_gui *gui, const char *path,
 // The files on the device changed (delete, new folder): reload the listing
 void
 sc_gui_files_changed(struct sc_gui *gui);
+
+// Show the recording state (the elapsed time is counted from now)
+void
+sc_gui_set_recording(struct sc_gui *gui, bool recording);
+
+// Flash the mirror (screenshot feedback)
+void
+sc_gui_flash(struct sc_gui *gui);
 
 // Indicate that a background device task (Wi-Fi switch, pairing...) is running
 void

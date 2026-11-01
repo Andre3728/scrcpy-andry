@@ -137,6 +137,10 @@ struct sc_gui_app {
     char *blocked_serial;
     // Serial of the current session (or NULL)
     const char *session_serial;
+    // Recording: file to record in the next session (owned), and the file
+    // recorded by the current session (kept string, or NULL)
+    char *record_next;
+    const char *recording_path;
     bool stop_requested;
     bool quit;
 
@@ -1230,6 +1234,138 @@ handle_app_event(struct sc_gui_app *app, const SDL_Event *event) {
     }
 }
 
+// ------------------------------------------------------------------ capture
+
+#ifdef _WIN32
+# define SC_PATH_SEP "\\"
+#else
+# define SC_PATH_SEP "/"
+#endif
+
+// Return "<user folder>/scrcpy/<prefix>_YYYYMMDD_HHMMSS.<ext>" (to be freed),
+// creating the scrcpy folder if needed
+static char *
+make_capture_path(SDL_Folder folder, const char *prefix, const char *ext) {
+    const char *base = SDL_GetUserFolder(folder);
+    if (!base) {
+        base = SDL_GetUserFolder(SDL_FOLDER_HOME);
+    }
+    if (!base) {
+        LOGE("Could not find a folder to save to: %s", SDL_GetError());
+        return NULL;
+    }
+
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%sscrcpy" SC_PATH_SEP, base);
+    if (!SDL_CreateDirectory(dir)) {
+        LOGW("Could not create %s: %s", dir, SDL_GetError());
+        return NULL;
+    }
+
+    SDL_Time now;
+    SDL_DateTime dt;
+    if (!SDL_GetCurrentTime(&now) || !SDL_TimeToDateTime(now, &dt, true)) {
+        memset(&dt, 0, sizeof(dt));
+    }
+
+    char path[1200];
+    snprintf(path, sizeof(path), "%s%s_%04d%02d%02d_%02d%02d%02d.%s", dir,
+             prefix, dt.year, dt.month, dt.day, dt.hour, dt.minute,
+             dt.second, ext);
+    return strdup(path);
+}
+
+#ifdef _WIN32
+// Copy the image to the Windows clipboard (CF_DIB)
+static bool
+copy_image_to_clipboard(SDL_Surface *surface) {
+    SDL_Surface *bgra = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_BGRA32);
+    if (!bgra) {
+        return false;
+    }
+
+    int w = bgra->w;
+    int h = bgra->h;
+    size_t row = (size_t) w * 4;
+    size_t size = sizeof(BITMAPINFOHEADER) + row * h;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!mem) {
+        SDL_DestroySurface(bgra);
+        return false;
+    }
+
+    uint8_t *data = GlobalLock(mem);
+    BITMAPINFOHEADER *header = (BITMAPINFOHEADER *) data;
+    memset(header, 0, sizeof(*header));
+    header->biSize = sizeof(*header);
+    header->biWidth = w;
+    header->biHeight = h; // bottom-up
+    header->biPlanes = 1;
+    header->biBitCount = 32;
+    header->biCompression = BI_RGB;
+    header->biSizeImage = (DWORD) (row * h);
+    uint8_t *pixels = data + sizeof(*header);
+    for (int y = 0; y < h; ++y) {
+        memcpy(pixels + row * (h - 1 - y),
+               (uint8_t *) bgra->pixels + (size_t) bgra->pitch * y, row);
+    }
+    GlobalUnlock(mem);
+    SDL_DestroySurface(bgra);
+
+    bool ok = false;
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        ok = SetClipboardData(CF_DIB, mem) != NULL;
+        CloseClipboard();
+    }
+    if (!ok) {
+        GlobalFree(mem);
+    }
+    return ok;
+}
+#else
+static bool
+copy_image_to_clipboard(SDL_Surface *surface) {
+    (void) surface;
+    return false;
+}
+#endif
+
+static void
+take_screenshot(struct sc_gui_app *app) {
+    if (!app->screen) {
+        return;
+    }
+
+    SDL_Surface *surface = sc_screen_capture(app->screen);
+    if (!surface) {
+        sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR,
+                          "Could not capture the screen.");
+        return;
+    }
+    sc_gui_flash(app->gui);
+
+    char *path = make_capture_path(SDL_FOLDER_PICTURES, "Screenshot", "png");
+    bool saved = path && SDL_SavePNG(surface, path);
+    bool copied = copy_image_to_clipboard(surface);
+    SDL_DestroySurface(surface);
+
+    char msg[1300];
+    if (saved) {
+        snprintf(msg, sizeof(msg), "Screenshot saved to %s%s", path,
+                 copied ? " and copied to the clipboard." : ".");
+        sc_gui_show_toast(app->gui, SC_GUI_TOAST_SUCCESS, msg);
+        LOGI("Screenshot saved: %s", path);
+    } else {
+        LOGE("Could not save the screenshot: %s", SDL_GetError());
+        sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR,
+                          copied ? "Could not save the screenshot (it was "
+                                   "copied to the clipboard)."
+                                 : "Could not save the screenshot.");
+    }
+    free(path);
+}
+
 // ---------------------------------------------------------- GUI callbacks
 
 static void
@@ -1427,6 +1563,42 @@ cb_on_pull_files(const char *const *paths, size_t count, bool choose_folder,
 }
 
 static void
+cb_on_screenshot(void *userdata) {
+    struct sc_gui_app *app = userdata;
+    take_screenshot(app);
+}
+
+static void
+cb_on_toggle_recording(void *userdata) {
+    struct sc_gui_app *app = userdata;
+    if (!app->session_serial) {
+        return;
+    }
+
+    if (app->recording_path) {
+        // Stop: restart without recording (the file is finalized when the
+        // session ends)
+        replace_string(&app->record_next, NULL);
+    } else {
+        free(app->record_next);
+        app->record_next =
+            make_capture_path(SDL_FOLDER_VIDEOS, "Recording", "mp4");
+        if (!app->record_next) {
+            sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR,
+                              "Could not create the recording file.");
+            return;
+        }
+    }
+
+    // The recorder is attached when a session starts: restart it
+    char *serial = strdup(app->session_serial);
+    if (serial) {
+        cb_on_start_session(serial, app);
+        free(serial);
+    }
+}
+
+static void
 cb_on_prefs_changed(const struct sc_gui_prefs *prefs, void *userdata) {
     struct sc_gui_app *app = userdata;
     app->config.prefs = *prefs;
@@ -1458,6 +1630,7 @@ host_on_screen(struct sc_screen *screen, void *userdata) {
                            app->session_serial,
                            device_name(app, app->session_serial),
                            app->session_options.control);
+        sc_gui_set_recording(app->gui, app->recording_path != NULL);
     }
 }
 
@@ -1513,6 +1686,19 @@ run_session(struct sc_gui_app *app) {
     options->serial = kept;
     options->window = true;
 
+    app->recording_path = NULL;
+    if (app->record_next) {
+        // Consumed: a reconnection does not record (it would overwrite)
+        const char *record = keep_string(app, app->record_next);
+        replace_string(&app->record_next, NULL);
+        if (record) {
+            options->record_filename = record;
+            options->record_format = SC_RECORD_FORMAT_MP4;
+            app->recording_path = record;
+            LOGI("Recording to %s", record);
+        }
+    }
+
     sc_strncpy(app->config.last_serial, kept, sizeof(app->config.last_serial));
     save_config(app);
 
@@ -1525,6 +1711,15 @@ run_session(struct sc_gui_app *app) {
     app->insets = sc_gui_get_insets(app->gui);
     sc_gui_set_session(app->gui, SC_GUI_SESSION_NONE, NULL, NULL, false);
     sc_gui_set_profile(app->gui, &app->config.defaults, "Default");
+
+    if (app->recording_path) {
+        char rec_msg[1100];
+        snprintf(rec_msg, sizeof(rec_msg), "Recording saved to %s",
+                 app->recording_path);
+        sc_gui_show_toast(app->gui, SC_GUI_TOAST_SUCCESS, rec_msg);
+        app->recording_path = NULL;
+    }
+    sc_gui_set_recording(app->gui, false);
 
     if (host.quit_requested) {
         app->quit = true;
@@ -1718,6 +1913,8 @@ scrcpy_gui(struct scrcpy_options *options) {
         .on_delete_files = cb_on_delete_files,
         .on_create_dir = cb_on_create_dir,
         .on_pull_files = cb_on_pull_files,
+        .on_screenshot = cb_on_screenshot,
+        .on_toggle_recording = cb_on_toggle_recording,
     };
     struct sc_gui_params gui_params = {
         .window = app->window,
@@ -1847,6 +2044,7 @@ end_adb:
     free(app->start_serial);
     free(app->reconnect_serial);
     free(app->blocked_serial);
+    free(app->record_next);
     // All the sessions are terminated, the serials are not referenced anymore
     for (size_t i = 0; i < app->kept_count; ++i) {
         free(app->kept_strings[i]);

@@ -298,6 +298,26 @@ Each milestone is usable and mergeable on its own.
 - The last opened page is remembered (`"page"` in config.json).
 - Verified on device: /sdcard/ listing rendered correctly.
 
+### M6 — Capture (implemented, needs hands-on)
+
+- Screenshot (toolbar camera button): `sc_screen_capture()` renders the
+  current video texture into an offscreen target at the video resolution
+  (with the client orientation) and reads it back; saved as PNG
+  (`SDL_SavePNG`) to `Pictures\scrcpy\Screenshot_<date>_<time>.png` and copied
+  to the clipboard (Windows: CF_DIB; other platforms: not yet). Flash
+  feedback on the mirror.
+- Recording (toolbar record button): **deviation from the plan** — the
+  upstream recorder is a packet sink attached when the demuxers start, and
+  attaching it to running demuxers needs invasive threading changes in the
+  core. As agreed in the fallback, starting/stopping a recording restarts
+  the session with `--record=<Videos>\scrcpy\Recording_<date>_<time>.mp4`
+  (about one second of interruption, stated in the tooltip). The sidebar
+  header shows a blinking "Recording mm:ss". A toast gives the file path when
+  it is finalized. A reconnection does not resume recording (it would
+  overwrite the file).
+- Toolbar: 12 buttons (32 px) in 4 groups: sidebar | back, home, recents |
+  volume, power, rotate | screenshot, record, transfers, more.
+
 
 ## Build and test
 

@@ -184,6 +184,12 @@ sc_screen_join(struct sc_screen *screen);
 void
 sc_screen_destroy(struct sc_screen *screen);
 
+// scrcpy-gui: capture the current video frame (oriented, at the video
+// resolution). Return NULL if there is no frame. The surface must be destroyed
+// with SDL_DestroySurface().
+SDL_Surface *
+sc_screen_capture(struct sc_screen *screen);
+
 // scrcpy-gui: run a toolbar/menu action
 void
 sc_screen_handle_gui_action(struct sc_screen *screen,
