@@ -112,6 +112,7 @@ const struct scrcpy_options scrcpy_options_default = {
     .camera_high_speed = false,
     .list = 0,
     .window = true,
+    .gui = false,
     .mouse_hover = true,
     .audio_dup = false,
     .new_display = NULL,

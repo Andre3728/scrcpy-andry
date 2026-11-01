@@ -235,9 +235,47 @@ configure_file(configuration: conf, output: 'config.h')
 
 src_dir = include_directories('src')
 
-executable('scrcpy', src,
+# scrcpy-gui: control panel drawn with Dear ImGui (C++)
+add_languages('cpp', native: false)
+
+imgui_dir = include_directories('src/gui/third_party/imgui')
+imgui_lib = static_library('imgui',
+    'src/gui/third_party/imgui/imgui.cpp',
+    'src/gui/third_party/imgui/imgui_draw.cpp',
+    'src/gui/third_party/imgui/imgui_tables.cpp',
+    'src/gui/third_party/imgui/imgui_widgets.cpp',
+    'src/gui/third_party/imgui/imgui_impl_sdl3.cpp',
+    'src/gui/third_party/imgui/imgui_impl_sdlrenderer3.cpp',
+    include_directories: imgui_dir,
+    dependencies: dependency('sdl3', version: '>= 3.2.0', static: static),
+    override_options: ['cpp_std=c++17', 'warning_level=0'])
+
+python = import('python').find_installation()
+gui_fonts_h = custom_target('gui_fonts.h',
+    output: 'gui_fonts.h',
+    input: [
+        'src/gui/embed.py',
+        'data/fonts/Inter-Regular.ttf',
+        'data/fonts/Inter-SemiBold.ttf',
+        'data/fonts/lucide.ttf',
+    ],
+    command: [python, '@INPUT0@', '@OUTPUT@',
+              'font_inter_regular=@INPUT1@',
+              'font_inter_semibold=@INPUT2@',
+              'font_lucide=@INPUT3@'])
+
+gui_lib = static_library('gui',
+    'src/gui/gui.cpp',
+    gui_fonts_h,
+    include_directories: [src_dir, imgui_dir],
+    link_with: imgui_lib,
+    dependencies: dependency('sdl3', version: '>= 3.2.0', static: static),
+    override_options: ['cpp_std=c++17'])
+
+executable('scrcpy-gui', src,
            dependencies: dependencies,
            include_directories: src_dir,
+           link_with: gui_lib,
            install: true,
            c_args: [])
 

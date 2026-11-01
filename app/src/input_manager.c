@@ -1208,3 +1208,71 @@ sc_input_manager_handle_event(struct sc_input_manager *im,
             break;
     }
 }
+
+void
+sc_input_manager_handle_gui_action(struct sc_input_manager *im,
+                                   enum sc_gui_action action) {
+    if (!im->controller || im->camera || im->disconnected) {
+        return;
+    }
+
+    // Actions sending key events require a key processor
+    bool has_kp = im->kp;
+
+    switch (action) {
+        case SC_GUI_ACTION_BACK:
+            if (has_kp) {
+                press_back_or_turn_screen_on(im, SC_ACTION_DOWN);
+                press_back_or_turn_screen_on(im, SC_ACTION_UP);
+            }
+            break;
+        case SC_GUI_ACTION_HOME:
+            if (has_kp) {
+                action_home(im, SC_ACTION_DOWN);
+                action_home(im, SC_ACTION_UP);
+            }
+            break;
+        case SC_GUI_ACTION_APP_SWITCH:
+            if (has_kp) {
+                action_app_switch(im, SC_ACTION_DOWN);
+                action_app_switch(im, SC_ACTION_UP);
+            }
+            break;
+        case SC_GUI_ACTION_VOLUME_DOWN:
+            if (has_kp) {
+                action_volume_down(im, SC_ACTION_DOWN);
+                action_volume_down(im, SC_ACTION_UP);
+            }
+            break;
+        case SC_GUI_ACTION_VOLUME_UP:
+            if (has_kp) {
+                action_volume_up(im, SC_ACTION_DOWN);
+                action_volume_up(im, SC_ACTION_UP);
+            }
+            break;
+        case SC_GUI_ACTION_POWER:
+            if (has_kp) {
+                action_power(im, SC_ACTION_DOWN);
+                action_power(im, SC_ACTION_UP);
+            }
+            break;
+        case SC_GUI_ACTION_ROTATE_DEVICE:
+            rotate_device(im);
+            break;
+        case SC_GUI_ACTION_EXPAND_NOTIFICATION_PANEL:
+            expand_notification_panel(im);
+            break;
+        case SC_GUI_ACTION_EXPAND_SETTINGS_PANEL:
+            expand_settings_panel(im);
+            break;
+        case SC_GUI_ACTION_COLLAPSE_PANELS:
+            collapse_panels(im);
+            break;
+        case SC_GUI_ACTION_SCREEN_OFF:
+            set_display_power(im, false);
+            break;
+        case SC_GUI_ACTION_SCREEN_ON:
+            set_display_power(im, true);
+            break;
+    }
+}

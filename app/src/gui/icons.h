@@ -1,0 +1,35 @@
+#ifndef SC_GUI_ICONS_H
+#define SC_GUI_ICONS_H
+
+// Lucide icon font codepoints (lucide-static 1.59.0, font/info.json)
+
+#define SC_ICON_ARROW_DOWN_TO_LINE ""
+#define SC_ICON_BELL               ""
+#define SC_ICON_CAMERA             ""
+#define SC_ICON_CHECK              ""
+#define SC_ICON_CHEVRON_LEFT       ""
+#define SC_ICON_CHEVRONS_UP        ""
+#define SC_ICON_CIRCLE             ""
+#define SC_ICON_CIRCLE_DOT         ""
+#define SC_ICON_ELLIPSIS           ""
+#define SC_ICON_FOLDER             ""
+#define SC_ICON_INFO               ""
+#define SC_ICON_KEYBOARD           ""
+#define SC_ICON_LAYOUT_GRID        ""
+#define SC_ICON_MONITOR            ""
+#define SC_ICON_MONITOR_OFF        ""
+#define SC_ICON_MOON               ""
+#define SC_ICON_PACKAGE            ""
+#define SC_ICON_PANEL_LEFT         ""
+#define SC_ICON_POWER              ""
+#define SC_ICON_ROTATE_CW          ""
+#define SC_ICON_SETTINGS           ""
+#define SC_ICON_SMARTPHONE         ""
+#define SC_ICON_SQUARE             ""
+#define SC_ICON_SUN                ""
+#define SC_ICON_UPLOAD             ""
+#define SC_ICON_USB                ""
+#define SC_ICON_VOLUME_1           ""
+#define SC_ICON_VOLUME_2           ""
+
+#endif

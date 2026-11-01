@@ -10,6 +10,7 @@
 
 #include "controller.h"
 #include "file_pusher.h"
+#include "gui/gui.h"
 #include "options.h"
 #include "trait/gamepad_processor.h"
 #include "trait/key_processor.h"
@@ -72,5 +73,10 @@ sc_input_manager_init(struct sc_input_manager *im,
 void
 sc_input_manager_handle_event(struct sc_input_manager *im,
                               const SDL_Event *event);
+
+// Run an action requested from the GUI toolbar or menus
+void
+sc_input_manager_handle_gui_action(struct sc_input_manager *im,
+                                   enum sc_gui_action action);
 
 #endif

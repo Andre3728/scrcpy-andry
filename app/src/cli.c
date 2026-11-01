@@ -93,6 +93,7 @@ enum {
     OPT_NO_MOUSE_HOVER,
     OPT_AUDIO_DUP,
     OPT_GAMEPAD,
+    OPT_GUI,
     OPT_NEW_DISPLAY,
     OPT_LIST_APPS,
     OPT_START_APP,
@@ -425,6 +426,12 @@ static const struct sc_option options[] = {
                 "\"aoa\" simulates physical gamepads using the AOAv2 protocol."
                 "It may only work over USB.\n"
                 "Also see --keyboard and --mouse.",
+    },
+    {
+        .longopt_id = OPT_GUI,
+        .longopt = "gui",
+        .text = "Show the scrcpy-gui control panel next to the device mirror.\n"
+                "This is the default when no arguments are given.",
     },
     {
         .shortopt = 'h',
@@ -2946,6 +2953,9 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                 if (!parse_gamepad(optarg, &opts->gamepad_input_mode)) {
                     return false;
                 }
+                break;
+            case OPT_GUI:
+                opts->gui = true;
                 break;
             case OPT_NEW_DISPLAY:
                 opts->new_display = optarg ? optarg : "";

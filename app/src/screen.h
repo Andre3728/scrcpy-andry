@@ -15,6 +15,7 @@
 #include "disconnect.h"
 #include "fps_counter.h"
 #include "frame_buffer.h"
+#include "gui/gui.h"
 #include "input_manager.h"
 #include "mouse_capture.h"
 #include "options.h"
@@ -111,6 +112,11 @@ struct sc_screen {
         sc_tick time; // 0 means none
         struct sc_size size;
     } resize_tracker;
+
+    // scrcpy-gui panel (NULL if disabled)
+    struct sc_gui *gui;
+    // GUI insets currently applied to the window size
+    struct sc_gui_insets gui_insets;
 };
 
 struct sc_screen_params {
@@ -150,6 +156,8 @@ struct sc_screen_params {
 
     bool fullscreen;
     bool start_fps_counter;
+
+    bool gui; // show the scrcpy-gui panel
 };
 
 // initialize screen, create window, renderer and texture (window is hidden)

@@ -56,6 +56,11 @@ main_scrcpy(int argc, char *argv[]) {
         goto end;
     }
 
+    if (argc <= 1) {
+        // scrcpy-gui: launching without arguments opens the GUI
+        args.opts.gui = true;
+    }
+
     sc_set_log_level(args.opts.log_level);
 
     if (args.opts.update_terminal_title) {
