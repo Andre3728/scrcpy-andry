@@ -298,6 +298,12 @@ compute_content_rect(struct sc_size window_size, struct sc_size content_size,
 
 static void
 sc_screen_update_content_rect(struct sc_screen *screen) {
+    if (!screen->content_size.width || !screen->content_size.height) {
+        // No content yet
+        memset(&screen->rect, 0, sizeof(screen->rect));
+        return;
+    }
+
     struct sc_size window_size = get_video_area_size(screen);
     compute_content_rect(window_size, screen->content_size,
                          screen->is_icon_active, screen->render_fit,
@@ -605,16 +611,14 @@ update_window_minimum_size(struct sc_screen *screen) {
     }
 }
 
-static void
-sc_screen_on_gui_action(enum sc_gui_action action, void *userdata) {
-    struct sc_screen *screen = userdata;
+void
+sc_screen_handle_gui_action(struct sc_screen *screen,
+                            enum sc_gui_action action) {
     sc_input_manager_handle_gui_action(&screen->im, action);
 }
 
-static void
-sc_screen_on_gui_insets_changed(void *userdata) {
-    struct sc_screen *screen = userdata;
-
+void
+sc_screen_handle_gui_insets_changed(struct sc_screen *screen) {
     struct sc_size old_reserved = get_reserved_size(screen->gui_insets);
     screen->gui_insets = sc_gui_get_insets(screen->gui);
     struct sc_size new_reserved = get_reserved_size(screen->gui_insets);
@@ -645,32 +649,9 @@ sc_screen_on_gui_insets_changed(void *userdata) {
 }
 
 static void
-sc_screen_init_gui(struct sc_screen *screen,
-                   const struct sc_screen_params *params) {
-    static const struct sc_gui_callbacks cbs = {
-        .on_action = sc_screen_on_gui_action,
-        .on_insets_changed = sc_screen_on_gui_insets_changed,
-    };
-
-    struct sc_gui_params gui_params = {
-        .window = screen->window,
-        .renderer = screen->renderer,
-        .device_name = params->window_title,
-        .control = params->controller != NULL,
-        .sdl_shortcut_mods = sc_shortcut_mods_to_sdl(params->shortcut_mods),
-        .redraw_event_type = SC_EVENT_GUI_REDRAW,
-        .cbs = &cbs,
-        .cbs_userdata = screen,
-    };
-
-    screen->gui = sc_gui_create(&gui_params);
-    if (!screen->gui) {
-        // Not fatal, mirror without the GUI
-        LOGE("Could not initialize the GUI");
-        return;
-    }
-
-    screen->gui_insets = sc_gui_get_insets(screen->gui);
+sc_screen_attach_gui(struct sc_screen *screen, struct sc_gui *gui) {
+    screen->gui = gui;
+    screen->gui_insets = sc_gui_get_insets(gui);
     // The window contains more than the video, its aspect ratio is free
     screen->window_aspect_ratio_lock = false;
     update_window_minimum_size(screen);
@@ -690,6 +671,9 @@ sc_screen_init(struct sc_screen *screen,
     screen->disconnect_started = false;
     screen->gui = NULL;
     memset(&screen->gui_insets, 0, sizeof(screen->gui_insets));
+    screen->hosted = params->host_window != NULL;
+    memset(&screen->content_size, 0, sizeof(screen->content_size));
+    memset(&screen->rect, 0, sizeof(screen->rect));
 
     screen->video = params->video;
     screen->camera = params->camera;
@@ -734,6 +718,18 @@ sc_screen_init(struct sc_screen *screen,
             LOGI("Initial display orientation set to %s",
                  sc_orientation_get_name(screen->orientation));
         }
+    }
+
+    if (screen->hosted) {
+        // scrcpy-gui: the window and renderer are owned by the GUI app
+        assert(params->host_renderer);
+        screen->window = params->host_window;
+        screen->renderer = params->host_renderer;
+#ifdef SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
+        screen->gl_context = NULL;
+#endif
+        SDL_SetWindowTitle(screen->window, params->window_title);
+        goto window_ready;
     }
 
     // Always create the window hidden to prevent blinking during initialization
@@ -807,6 +803,8 @@ sc_screen_init(struct sc_screen *screen,
     }
 #endif
 
+window_ready:
+    ;
     bool mipmaps = params->video && params->mipmaps;
     ok = sc_texture_init(&screen->tex, screen->renderer, mipmaps,
                          params->hwdec_mode);
@@ -872,7 +870,7 @@ sc_screen_init(struct sc_screen *screen,
     sc_input_manager_init(&screen->im, &im_params);
 
     if (params->gui) {
-        sc_screen_init_gui(screen, params);
+        sc_screen_attach_gui(screen, params->gui);
     }
 
     // Initialize even if not used for simplicity
@@ -903,6 +901,11 @@ sc_screen_init(struct sc_screen *screen,
     screen->open = false;
 #endif
 
+    if (screen->hosted) {
+        // The window is already visible (it shows the GUI)
+        screen->window_shown = true;
+    }
+
     if (!screen->video) {
         // Show the window immediately
         screen->window_shown = true;
@@ -919,14 +922,18 @@ sc_screen_init(struct sc_screen *screen,
 error_destroy_texture:
     sc_texture_destroy(&screen->tex);
 error_destroy_renderer:
+    if (!screen->hosted) {
 #ifdef SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
-    if (screen->gl_context) {
-        SDL_GL_DestroyContext(screen->gl_context);
-    }
+        if (screen->gl_context) {
+            SDL_GL_DestroyContext(screen->gl_context);
+        }
 #endif
-    SDL_DestroyRenderer(screen->renderer);
+        SDL_DestroyRenderer(screen->renderer);
+    }
 error_destroy_window:
-    SDL_DestroyWindow(screen->window);
+    if (!screen->hosted) {
+        SDL_DestroyWindow(screen->window);
+    }
 error_destroy_fps_counter:
     sc_fps_counter_destroy(&screen->fps_counter);
 error_destroy_frame_buffer:
@@ -961,6 +968,17 @@ sc_screen_show_initial_window(struct sc_screen *screen) {
         sc_screen_track_resize(screen, window_size);
     }
 
+    if (screen->hosted) {
+        // The window already exists: resize it for the device, but keep its
+        // position and state
+        if (is_windowed(screen)) {
+            set_video_area_size(screen, window_size);
+        }
+        screen->window_shown = true;
+        sc_screen_update_content_rect(screen);
+        return;
+    }
+
     assert(is_windowed(screen));
     set_aspect_ratio(screen, screen->content_size);
     set_video_area_size(screen, window_size);
@@ -981,7 +999,9 @@ sc_screen_show_initial_window(struct sc_screen *screen) {
 
 void
 sc_screen_hide_window(struct sc_screen *screen) {
-    sc_sdl_hide_window(screen->window);
+    if (!screen->hosted) {
+        sc_sdl_hide_window(screen->window);
+    }
     screen->window_shown = false;
 }
 
@@ -1015,14 +1035,23 @@ sc_screen_destroy(struct sc_screen *screen) {
     }
     sc_texture_destroy(&screen->tex);
     av_frame_free(&screen->frame);
-    if (screen->gui) {
-        sc_gui_destroy(screen->gui);
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+    if (screen->video) {
+        SDL_RemoveEventWatch(event_watcher, screen);
     }
-#ifdef SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
-    SDL_GL_DestroyContext(screen->gl_context);
 #endif
-    SDL_DestroyRenderer(screen->renderer);
-    SDL_DestroyWindow(screen->window);
+    if (screen->hosted) {
+        // The window and renderer outlive the screen
+        if (screen->icon_tex) {
+            SDL_DestroyTexture(screen->icon_tex);
+        }
+    } else {
+#ifdef SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
+        SDL_GL_DestroyContext(screen->gl_context);
+#endif
+        SDL_DestroyRenderer(screen->renderer);
+        SDL_DestroyWindow(screen->window);
+    }
     sc_fps_counter_destroy(&screen->fps_counter);
     sc_frame_buffer_destroy(&screen->fb);
     sc_mutex_destroy(&screen->mutex);
@@ -1416,6 +1445,12 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             screen->disconnected = true;
             if (!screen->window_shown) {
                 // No window open
+                return;
+            }
+
+            if (screen->hosted) {
+                // scrcpy-gui: the app shows the disconnection itself
+                sc_input_manager_handle_event(&screen->im, event);
                 return;
             }
 

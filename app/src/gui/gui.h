@@ -3,12 +3,18 @@
 
 // scrcpy-gui control panel, drawn with Dear ImGui into the scrcpy window.
 //
-// The GUI owns the window "chrome" (sidebar on the left, toolbar under the
-// mirror). The screen asks for the insets to lay out the video, forwards
-// every SDL event first, and calls sc_gui_render() between drawing the video
-// and presenting.
+// The GUI is owned by the GUI app (gui_app.c) and outlives mirroring sessions.
+// It draws the window "chrome" (sidebar on the left, toolbar under the
+// mirror). The owner asks for the insets to lay out the video, forwards every
+// SDL event first, and calls sc_gui_render() between drawing the video and
+// presenting.
+//
+// Callbacks are never called from sc_gui_render(): user actions are queued
+// and dispatched from the next sc_gui_handle_event() call, so that callbacks
+// may safely resize the window or render.
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <SDL3/SDL.h>
 
@@ -42,24 +48,51 @@ enum sc_gui_action {
 };
 
 struct sc_gui_callbacks {
-    // A toolbar/menu action was triggered
+    // A toolbar/menu action was triggered (only while mirroring)
     void (*on_action)(enum sc_gui_action action, void *userdata);
     // The insets changed (e.g. the sidebar was toggled)
     void (*on_insets_changed)(void *userdata);
+
+    // Device management
+    void (*on_start_session)(const char *serial, void *userdata);
+    void (*on_stop_session)(void *userdata);
+    void (*on_switch_to_wifi)(const char *serial, void *userdata);
+    void (*on_pair)(const char *address, const char *code, void *userdata);
+    void (*on_connect)(const char *address, void *userdata);
+    void (*on_disconnect)(const char *address, void *userdata);
 };
 
 struct sc_gui_params {
     SDL_Window *window;
     SDL_Renderer *renderer;
-    const char *device_name;
-    bool control; // false if the device cannot be controlled
     // SDL modifiers of the scrcpy shortcut key (always forwarded)
     uint16_t sdl_shortcut_mods;
     // SDL event type pushed when the GUI needs another frame (animations,
-    // hover state settling); the screen must call sc_gui_render() on it
+    // hover state settling, pending callbacks); the owner must forward it to
+    // sc_gui_handle_event() and render
     uint32_t redraw_event_type;
     const struct sc_gui_callbacks *cbs;
     void *cbs_userdata;
+};
+
+// A device as listed by "adb devices -l"
+struct sc_gui_device {
+    const char *serial;
+    const char *model; // may be NULL
+    const char *state; // "device", "unauthorized", "offline"...
+    bool tcpip; // connected over TCP/IP
+};
+
+enum sc_gui_session_state {
+    SC_GUI_SESSION_NONE,
+    SC_GUI_SESSION_CONNECTING,
+    SC_GUI_SESSION_RUNNING,
+};
+
+enum sc_gui_toast_level {
+    SC_GUI_TOAST_INFO,
+    SC_GUI_TOAST_SUCCESS,
+    SC_GUI_TOAST_ERROR,
 };
 
 struct sc_gui *
@@ -71,7 +104,7 @@ sc_gui_destroy(struct sc_gui *gui);
 // Process an event.
 //
 // mirror_rect is the rectangle where the video is drawn, in window
-// coordinates (NULL if there is no video yet).
+// coordinates (NULL if there is no video).
 //
 // Return true if the event was consumed by the GUI and must not be forwarded
 // to the device.
@@ -90,6 +123,10 @@ sc_gui_get_insets(struct sc_gui *gui);
 void
 sc_gui_get_minimum_area(struct sc_gui *gui, float *width, float *height);
 
+// Default size of the video area when there is no video (window coordinates)
+void
+sc_gui_get_default_area(struct sc_gui *gui, float *width, float *height);
+
 // Background color to clear the window with (0xRRGGBB)
 uint32_t
 sc_gui_get_background_color(struct sc_gui *gui);
@@ -97,6 +134,25 @@ sc_gui_get_background_color(struct sc_gui *gui);
 // Draw the GUI on top of the current render target (does not present)
 void
 sc_gui_render(struct sc_gui *gui, const SDL_FRect *mirror_rect);
+
+// Replace the list of devices (the data is copied)
+void
+sc_gui_set_devices(struct sc_gui *gui, const struct sc_gui_device *devices,
+                   size_t count);
+
+// Set the current session state (serial and device_name may be NULL)
+void
+sc_gui_set_session(struct sc_gui *gui, enum sc_gui_session_state state,
+                   const char *serial, const char *device_name, bool control);
+
+// Show a transient notification
+void
+sc_gui_show_toast(struct sc_gui *gui, enum sc_gui_toast_level level,
+                  const char *text);
+
+// Indicate that a background device task (Wi-Fi switch, pairing...) is running
+void
+sc_gui_set_task_busy(struct sc_gui *gui, bool busy);
 
 #ifdef __cplusplus
 }

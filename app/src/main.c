@@ -11,6 +11,7 @@
 #include "events.h"
 #include "options.h"
 #include "scrcpy.h"
+#include "gui_app.h"
 #ifdef HAVE_USB
 # include "usb/scrcpy_otg.h"
 #endif
@@ -100,10 +101,15 @@ main_scrcpy(int argc, char *argv[]) {
     }
 
 #ifdef HAVE_USB
-    ret = args.opts.otg ? scrcpy_otg(&args.opts) : scrcpy(&args.opts);
-#else
-    ret = scrcpy(&args.opts);
+    if (args.opts.otg) {
+        ret = scrcpy_otg(&args.opts);
+    } else
 #endif
+    if (args.opts.gui) {
+        ret = scrcpy_gui(&args.opts);
+    } else {
+        ret = scrcpy(&args.opts);
+    }
 
     sc_main_thread_destroy();
 

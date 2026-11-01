@@ -1,8 +1,13 @@
 #include "gui/gui.h"
 
 #include <cassert>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <new>
 #include <string>
+#include <vector>
 
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
@@ -21,6 +26,14 @@ constexpr float FONT_SIZE = 14.f;
 constexpr float TITLE_FONT_SIZE = 20.f;
 constexpr float ICON_FONT_SIZE = 17.f;
 constexpr float TOOLBAR_BUTTON_SIZE = 36.f;
+constexpr float DEFAULT_AREA_WIDTH = 420.f;
+constexpr float DEFAULT_AREA_HEIGHT = 760.f;
+
+constexpr int TOOLBAR_BUTTONS = 9;
+constexpr int TOOLBAR_SEPARATORS = 3;
+
+constexpr Uint64 TOAST_DURATION_MS = 4000;
+constexpr Uint64 TOAST_ERROR_DURATION_MS = 7000;
 
 enum class Page { DEVICES, FILES, APPS, SETTINGS };
 enum class Appearance { SYSTEM, LIGHT, DARK };
@@ -34,12 +47,15 @@ struct Palette {
     ImU32 text;
     ImU32 text_secondary;
     ImU32 accent;
+    ImU32 accent_text; // text on accent background
     ImU32 hover;
     ImU32 selected;
     ImU32 toolbar_bg;
     ImU32 toolbar_border;
     ImU32 segment_selected;
     ImU32 success;
+    ImU32 warning;
+    ImU32 error;
     uint32_t window_bg_rgb; // same as window_bg, for SDL
 };
 
@@ -62,12 +78,15 @@ dark_palette() {
     p.text = rgba(0xF5F5F7);
     p.text_secondary = rgba(0x98989D);
     p.accent = rgba(0x0A84FF);
+    p.accent_text = rgba(0xFFFFFF);
     p.hover = rgba(0xFFFFFF, 0.06f);
     p.selected = rgba(0xFFFFFF, 0.11f);
-    p.toolbar_bg = rgba(0x2C2C2E, 0.96f);
+    p.toolbar_bg = rgba(0x2C2C2E, 0.97f);
     p.toolbar_border = rgba(0x48484A);
     p.segment_selected = rgba(0x636366);
     p.success = rgba(0x30D158);
+    p.warning = rgba(0xFF9F0A);
+    p.error = rgba(0xFF453A);
     return p;
 }
 
@@ -83,12 +102,15 @@ light_palette() {
     p.text = rgba(0x1D1D1F);
     p.text_secondary = rgba(0x6E6E73);
     p.accent = rgba(0x007AFF);
+    p.accent_text = rgba(0xFFFFFF);
     p.hover = rgba(0x000000, 0.05f);
-    p.selected = rgba(0x000000, 0.09f);
-    p.toolbar_bg = rgba(0xFFFFFF, 0.96f);
+    p.selected = rgba(0x000000, 0.08f);
+    p.toolbar_bg = rgba(0xFFFFFF, 0.97f);
     p.toolbar_border = rgba(0xD1D1D6);
     p.segment_selected = rgba(0xFFFFFF);
     p.success = rgba(0x28A745);
+    p.warning = rgba(0xC93400);
+    p.error = rgba(0xD70015);
     return p;
 }
 
@@ -105,7 +127,8 @@ point_in_rect(float x, float y, const SDL_FRect *r) {
 // Keep SDL text input always enabled: scrcpy relies on SDL_EVENT_TEXT_INPUT
 // to inject text into the device, so ImGui must never stop it
 void
-set_ime_data(ImGuiContext *, ImGuiViewport *viewport, ImGuiPlatformImeData *data) {
+set_ime_data(ImGuiContext *, ImGuiViewport *viewport,
+             ImGuiPlatformImeData *data) {
     SDL_Window *window = (SDL_Window *) viewport->PlatformHandleRaw;
     if (!window || !data->WantVisible) {
         return;
@@ -118,6 +141,22 @@ set_ime_data(ImGuiContext *, ImGuiViewport *viewport, ImGuiPlatformImeData *data
     SDL_SetTextInputArea(window, &r, 0);
 }
 
+struct Device {
+    std::string serial;
+    std::string model;
+    std::string state;
+    bool tcpip;
+
+    const std::string &name() const { return model.empty() ? serial : model; }
+    bool ready() const { return state == "device"; }
+};
+
+struct Toast {
+    sc_gui_toast_level level;
+    std::string text;
+    Uint64 expire; // SDL_GetTicks() deadline
+};
+
 } // namespace
 
 struct sc_gui {
@@ -125,8 +164,6 @@ struct sc_gui {
     SDL_Renderer *renderer;
     ImGuiContext *ctx;
 
-    std::string device_name;
-    bool control;
     uint16_t sdl_shortcut_mods;
     uint32_t redraw_event_type;
     const sc_gui_callbacks *cbs;
@@ -142,6 +179,23 @@ struct sc_gui {
     Page page = Page::DEVICES;
     bool sidebar_visible = true;
 
+    // Devices and session
+    std::vector<Device> devices;
+    bool devices_known = false; // false until the first device list
+    sc_gui_session_state session = SC_GUI_SESSION_NONE;
+    std::string session_serial;
+    std::string session_name;
+    bool control = false;
+    bool task_busy = false;
+
+    // Wi-Fi form
+    int wifi_mode = 0; // 0: pair, 1: connect
+    char pair_address[64] = "";
+    char pair_code[16] = "";
+    char connect_address[64] = "";
+
+    std::vector<Toast> toasts;
+
     bool mirror_focused = false;
     // A mouse button was pressed on the mirror: forward all mouse events to
     // the device until all buttons are released
@@ -150,9 +204,12 @@ struct sc_gui {
     bool redraw_requested = false;
     // Extra frames to render so that ImGui hover/active states settle
     int settle_frames = 0;
-    // Low-rate redraw timer while an item is hovered (tooltip delays)
-    SDL_TimerID hover_timer = 0;
-    SDL_AtomicInt hover_timer_pending;
+    // Low-rate redraw timer (tooltip delays, animations, toast expiration)
+    SDL_TimerID timer = 0;
+    SDL_AtomicInt timer_pending;
+
+    // Callbacks requested during rendering, dispatched outside of it
+    std::vector<std::function<void()>> pending;
 
     float s(float v) const { return v * ui_scale; }
 };
@@ -164,6 +221,11 @@ is_fullscreen(sc_gui *gui) {
     return SDL_GetWindowFlags(gui->window) & SDL_WINDOW_FULLSCREEN;
 }
 
+bool
+is_mirroring(sc_gui *gui) {
+    return gui->session == SC_GUI_SESSION_RUNNING;
+}
+
 void
 request_redraw(sc_gui *gui) {
     gui->redraw_requested = true;
@@ -171,16 +233,55 @@ request_redraw(sc_gui *gui) {
 }
 
 void
-notify_insets_changed(sc_gui *gui) {
-    if (gui->cbs && gui->cbs->on_insets_changed) {
-        gui->cbs->on_insets_changed(gui->cbs_userdata);
+push_redraw_event(sc_gui *gui) {
+    SDL_Event event;
+    SDL_zero(event);
+    event.type = gui->redraw_event_type;
+    SDL_PushEvent(&event);
+}
+
+// Defer a callback until the next sc_gui_handle_event()
+void
+defer(sc_gui *gui, std::function<void()> fn) {
+    gui->pending.push_back(std::move(fn));
+}
+
+void
+dispatch_pending(sc_gui *gui) {
+    while (!gui->pending.empty()) {
+        std::vector<std::function<void()>> pending;
+        pending.swap(gui->pending);
+        for (auto &fn : pending) {
+            fn();
+        }
     }
 }
 
 void
+notify_insets_changed(sc_gui *gui) {
+    defer(gui, [gui] {
+        if (gui->cbs && gui->cbs->on_insets_changed) {
+            gui->cbs->on_insets_changed(gui->cbs_userdata);
+        }
+    });
+}
+
+void
 run_action(sc_gui *gui, sc_gui_action action) {
-    if (gui->cbs && gui->cbs->on_action) {
-        gui->cbs->on_action(action, gui->cbs_userdata);
+    defer(gui, [gui, action] {
+        if (gui->cbs && gui->cbs->on_action) {
+            gui->cbs->on_action(action, gui->cbs_userdata);
+        }
+    });
+}
+
+void
+add_toast(sc_gui *gui, sc_gui_toast_level level, const char *text) {
+    Uint64 duration = level == SC_GUI_TOAST_ERROR ? TOAST_ERROR_DURATION_MS
+                                                  : TOAST_DURATION_MS;
+    gui->toasts.push_back({level, text, SDL_GetTicks() + duration});
+    if (gui->toasts.size() > 4) {
+        gui->toasts.erase(gui->toasts.begin());
     }
 }
 
@@ -212,22 +313,26 @@ apply_style(sc_gui *gui) {
     style.SeparatorTextBorderSize = 1;
 
     ImVec4 *c = style.Colors;
-    c[ImGuiCol_Text] = ImGui::ColorConvertU32ToFloat4(p.text);
-    c[ImGuiCol_TextDisabled] = ImGui::ColorConvertU32ToFloat4(p.text_secondary);
-    c[ImGuiCol_WindowBg] = ImGui::ColorConvertU32ToFloat4(p.pane_bg);
-    c[ImGuiCol_ChildBg] = ImGui::ColorConvertU32ToFloat4(p.card_bg);
-    c[ImGuiCol_PopupBg] = ImGui::ColorConvertU32ToFloat4(p.toolbar_bg);
-    c[ImGuiCol_Border] = ImGui::ColorConvertU32ToFloat4(p.toolbar_border);
-    c[ImGuiCol_Separator] = ImGui::ColorConvertU32ToFloat4(p.separator);
-    c[ImGuiCol_Button] = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_ButtonHovered] = ImGui::ColorConvertU32ToFloat4(p.hover);
-    c[ImGuiCol_ButtonActive] = ImGui::ColorConvertU32ToFloat4(p.selected);
-    c[ImGuiCol_Header] = ImGui::ColorConvertU32ToFloat4(p.selected);
-    c[ImGuiCol_HeaderHovered] = ImGui::ColorConvertU32ToFloat4(p.accent);
-    c[ImGuiCol_HeaderActive] = ImGui::ColorConvertU32ToFloat4(p.accent);
-    c[ImGuiCol_FrameBg] = ImGui::ColorConvertU32ToFloat4(p.selected);
-    c[ImGuiCol_FrameBgHovered] = ImGui::ColorConvertU32ToFloat4(p.hover);
-    c[ImGuiCol_CheckMark] = ImGui::ColorConvertU32ToFloat4(p.accent);
+    auto f4 = [](ImU32 col) { return ImGui::ColorConvertU32ToFloat4(col); };
+    c[ImGuiCol_Text] = f4(p.text);
+    c[ImGuiCol_TextDisabled] = f4(p.text_secondary);
+    c[ImGuiCol_WindowBg] = f4(p.pane_bg);
+    c[ImGuiCol_ChildBg] = f4(p.card_bg);
+    c[ImGuiCol_PopupBg] = f4(p.toolbar_bg);
+    c[ImGuiCol_Border] = f4(p.toolbar_border);
+    c[ImGuiCol_Separator] = f4(p.separator);
+    c[ImGuiCol_Button] = f4(p.selected);
+    c[ImGuiCol_ButtonHovered] = f4(p.hover);
+    c[ImGuiCol_ButtonActive] = f4(p.selected);
+    c[ImGuiCol_Header] = f4(p.selected);
+    c[ImGuiCol_HeaderHovered] = f4(p.accent);
+    c[ImGuiCol_HeaderActive] = f4(p.accent);
+    c[ImGuiCol_FrameBg] = f4(p.selected);
+    c[ImGuiCol_FrameBgHovered] = f4(p.selected);
+    c[ImGuiCol_FrameBgActive] = f4(p.selected);
+    c[ImGuiCol_CheckMark] = f4(p.accent);
+    c[ImGuiCol_TextSelectedBg] = f4(p.accent & 0x66FFFFFF);
+    c[ImGuiCol_NavCursor] = f4(p.accent);
 
     style.ScaleAllSizes(gui->ui_scale);
     style.FontScaleDpi = gui->ui_scale;
@@ -339,7 +444,14 @@ text_wrapped_colored(ImU32 color, const char *text) {
     ImGui::PopStyleColor();
 }
 
-// Small uppercase-like section header, as in macOS sidebars
+void
+text_semibold(sc_gui *gui, const char *text) {
+    ImGui::PushFont(gui->font_semibold, 0);
+    ImGui::TextUnformatted(text);
+    ImGui::PopFont();
+}
+
+// Small header, as in macOS sidebars and grouped lists
 void
 section_header(sc_gui *gui, const char *label) {
     ImGui::PushFont(gui->font_semibold, 11.f);
@@ -353,6 +465,67 @@ page_title(sc_gui *gui, const char *title) {
     ImGui::TextUnformatted(title);
     ImGui::PopFont();
     ImGui::Dummy(ImVec2(0, gui->s(4)));
+}
+
+// Icon drawn at the given font size, inline
+void
+icon_text(ImU32 color, const char *icon, float size) {
+    ImGui::PushFont(nullptr, size);
+    text_colored(color, icon);
+    ImGui::PopFont();
+}
+
+// Spinning arc, for "in progress" states
+void
+spinner(sc_gui *gui, float radius, ImU32 color) {
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    float r = gui->s(radius);
+    ImGui::Dummy(ImVec2(r * 2, r * 2));
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    float t = (float) ImGui::GetTime() * 6.f;
+    ImVec2 center = pos + ImVec2(r, r);
+    dl->PathClear();
+    dl->PathArcTo(center, r - gui->s(1.5f), t, t + 4.4f, 24);
+    dl->PathStroke(color, 0, gui->s(2.5f));
+}
+
+// macOS-style push button. Primary buttons are filled with the accent color.
+bool
+push_button(sc_gui *gui, const char *label, bool primary = false,
+            float width = 0) {
+    if (primary) {
+        ImGui::PushStyleColor(ImGuiCol_Button, gui->pal.accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              gui->pal.accent & 0xE6FFFFFF);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                              gui->pal.accent & 0xCCFFFFFF);
+        ImGui::PushStyleColor(ImGuiCol_Text, gui->pal.accent_text);
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, gui->pal.selected);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              gui->dark ? rgba(0xFFFFFF, 0.16f)
+                                        : rgba(0x000000, 0.12f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                              gui->dark ? rgba(0xFFFFFF, 0.22f)
+                                        : rgba(0x000000, 0.16f));
+        ImGui::PushStyleColor(ImGuiCol_Text, gui->pal.text);
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(gui->s(12), gui->s(5)));
+    bool clicked = ImGui::Button(label, ImVec2(width, 0));
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(4);
+    return clicked;
+}
+
+void
+input_text(sc_gui *gui, const char *id, const char *hint, char *buf,
+           size_t size, ImGuiInputTextFlags flags = 0) {
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(gui->s(8), gui->s(6)));
+    ImGui::InputTextWithHint(id, hint, buf, size, flags);
+    ImGui::PopStyleVar();
 }
 
 // Sidebar row: icon + label, rounded highlight
@@ -379,10 +552,6 @@ nav_item(sc_gui *gui, const char *icon, const char *label, bool selected) {
     dl->AddText(ImVec2(pos.x + gui->s(10), ty - gui->s(1)), gui->pal.accent,
                 icon);
     dl->AddText(ImVec2(pos.x + gui->s(34), ty), gui->pal.text, label);
-
-    if (hovered) {
-        ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
-    }
     return clicked;
 }
 
@@ -409,13 +578,14 @@ toolbar_button(sc_gui *gui, const char *id, const char *icon,
     ImVec2 ts = ImGui::CalcTextSize(icon);
     ImU32 color = active ? gui->pal.accent : gui->pal.text;
     if (disabled) {
-        color = gui->pal.text_secondary;
+        color = gui->pal.text_secondary & 0x80FFFFFF;
     }
-    dl->AddText(ImVec2(center.x - ts.x / 2, center.y - ts.y / 2 - gui->s(1.5f)),
+    dl->AddText(ImVec2(center.x - ts.x / 2,
+                       center.y - ts.y / 2 - gui->s(1.5f)),
                 color, icon);
     ImGui::PopFont();
 
-    if (tooltip) {
+    if (tooltip && !disabled) {
         ImGui::SetItemTooltip("%s", tooltip);
     }
     return clicked;
@@ -427,7 +597,8 @@ toolbar_separator(sc_gui *gui) {
     ImVec2 pos = ImGui::GetCursorScreenPos();
     float size = gui->s(TOOLBAR_BUTTON_SIZE);
     float x = pos.x + gui->s(6);
-    dl->AddLine(ImVec2(x, pos.y + gui->s(9)), ImVec2(x, pos.y + size - gui->s(9)),
+    dl->AddLine(ImVec2(x, pos.y + gui->s(9)),
+                ImVec2(x, pos.y + size - gui->s(9)),
                 gui->pal.toolbar_border, gui->s(1));
     ImGui::Dummy(ImVec2(gui->s(12), size));
 }
@@ -494,15 +665,24 @@ void
 info_card(sc_gui *gui, const char *id, const char *icon, const char *title,
           const char *body) {
     if (begin_card(gui, id)) {
-        ImGui::PushFont(nullptr, 26.f);
-        text_colored(gui->pal.accent, icon);
-        ImGui::PopFont();
-        ImGui::PushFont(gui->font_semibold, 0);
-        ImGui::TextUnformatted(title);
-        ImGui::PopFont();
+        icon_text(gui->pal.accent, icon, 26.f);
+        text_semibold(gui, title);
         text_wrapped_colored(gui->pal.text_secondary, body);
     }
     end_card();
+}
+
+// Horizontally centered text in the current window
+void
+text_centered(ImU32 color, const char *text, float wrap_width) {
+    float avail = ImGui::GetContentRegionAvail().x;
+    ImVec2 size = ImGui::CalcTextSize(text, nullptr, false, wrap_width);
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - size.x) / 2);
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + size.x);
+    ImGui::TextUnformatted(text);
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
 }
 
 // --- Panels ---------------------------------------------------------------
@@ -511,6 +691,17 @@ constexpr ImGuiWindowFlags PANEL_FLAGS = ImGuiWindowFlags_NoDecoration
                                        | ImGuiWindowFlags_NoMove
                                        | ImGuiWindowFlags_NoSavedSettings
                                        | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+void
+status_dot(sc_gui *gui, ImU32 color) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float r = gui->s(3.5f);
+    dl->AddCircleFilled(p + ImVec2(r, ImGui::GetFontSize() / 2 + gui->s(1)),
+                        r, color);
+    ImGui::Dummy(ImVec2(r * 2 + gui->s(2), ImGui::GetFontSize()));
+    ImGui::SameLine();
+}
 
 void
 draw_nav(sc_gui *gui, float height) {
@@ -523,17 +714,23 @@ draw_nav(sc_gui *gui, float height) {
 
     // Device header
     ImGui::Indent(gui->s(6));
-    ImGui::PushFont(gui->font_semibold, 0);
-    ImGui::TextUnformatted(gui->device_name.c_str());
-    ImGui::PopFont();
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float r = gui->s(3.5f);
-    dl->AddCircleFilled(p + ImVec2(r, ImGui::GetFontSize() / 2 + gui->s(1)), r,
-                        gui->pal.success);
-    ImGui::Dummy(ImVec2(r * 2 + gui->s(2), 0));
-    ImGui::SameLine();
-    text_colored(gui->pal.text_secondary, "Connected");
+    switch (gui->session) {
+        case SC_GUI_SESSION_RUNNING:
+            text_semibold(gui, gui->session_name.c_str());
+            status_dot(gui, gui->pal.success);
+            text_colored(gui->pal.text_secondary, "Connected");
+            break;
+        case SC_GUI_SESSION_CONNECTING:
+            text_semibold(gui, gui->session_name.c_str());
+            status_dot(gui, gui->pal.warning);
+            text_colored(gui->pal.text_secondary, "Connecting...");
+            break;
+        default:
+            text_semibold(gui, "scrcpy-gui");
+            status_dot(gui, gui->pal.text_secondary);
+            text_colored(gui->pal.text_secondary, "Not connected");
+            break;
+    }
     ImGui::Unindent(gui->s(6));
 
     ImGui::Dummy(ImVec2(0, gui->s(10)));
@@ -565,25 +762,204 @@ draw_nav(sc_gui *gui, float height) {
 }
 
 void
-draw_page_devices(sc_gui *gui) {
-    page_title(gui, "Devices");
-    if (begin_card(gui, "##device")) {
-        ImGui::PushFont(nullptr, 26.f);
-        text_colored(gui->pal.accent, SC_ICON_SMARTPHONE);
-        ImGui::PopFont();
-        ImGui::PushFont(gui->font_semibold, 0);
-        ImGui::TextUnformatted(gui->device_name.c_str());
-        ImGui::PopFont();
-        text_colored(gui->pal.success, "Mirroring");
-        if (!gui->control) {
-            text_colored(gui->pal.text_secondary, "Control disabled");
+draw_onboarding(sc_gui *gui) {
+    if (begin_card(gui, "##onboarding")) {
+        icon_text(gui->pal.accent, SC_ICON_CABLE, 26.f);
+        text_semibold(gui, "Connect a device");
+        static const char *const steps[] = {
+            "Open Settings > About phone and tap Build number 7 times.",
+            "In Developer options, enable USB debugging.",
+            "Connect the phone with a USB cable and allow the prompt.",
+        };
+        int i = 1;
+        for (const char *step : steps) {
+            char num[8];
+            snprintf(num, sizeof(num), "%d.", i++);
+            text_colored(gui->pal.accent, num);
+            ImGui::SameLine();
+            text_wrapped_colored(gui->pal.text_secondary, step);
         }
     }
     end_card();
-    ImGui::Dummy(ImVec2(0, gui->s(4)));
-    text_wrapped_colored(gui->pal.text_secondary,
-                         "Switching devices and connecting over Wi-Fi will be "
-                         "available here in a future update.");
+}
+
+void
+draw_device_row(sc_gui *gui, const Device &d) {
+    bool current = gui->session != SC_GUI_SESSION_NONE
+                && d.serial == gui->session_serial;
+
+    ImGui::PushID(d.serial.c_str());
+
+    icon_text(gui->pal.accent, d.tcpip ? SC_ICON_WIFI : SC_ICON_USB, 18.f);
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    text_semibold(gui, d.name().c_str());
+    text_colored(gui->pal.text_secondary, d.serial.c_str());
+
+    if (current && gui->session == SC_GUI_SESSION_RUNNING) {
+        status_dot(gui, gui->pal.success);
+        text_colored(gui->pal.success, "Mirroring");
+    } else if (current) {
+        status_dot(gui, gui->pal.warning);
+        text_colored(gui->pal.text_secondary, "Connecting...");
+    } else if (d.state == "unauthorized") {
+        text_colored(gui->pal.warning, SC_ICON_TRIANGLE_ALERT " Unauthorized");
+        text_wrapped_colored(gui->pal.text_secondary,
+                             "Unlock the phone and allow USB debugging.");
+    } else if (d.state == "offline") {
+        text_colored(gui->pal.warning, SC_ICON_TRIANGLE_ALERT " Offline");
+        text_wrapped_colored(gui->pal.text_secondary,
+                             "Reconnect the cable or restart USB debugging.");
+    } else if (!d.ready()) {
+        text_colored(gui->pal.text_secondary, d.state.c_str());
+    }
+    ImGui::EndGroup();
+
+    // Actions
+    if (current) {
+        if (push_button(gui, "Stop")) {
+            defer(gui, [gui] {
+                if (gui->cbs && gui->cbs->on_stop_session) {
+                    gui->cbs->on_stop_session(gui->cbs_userdata);
+                }
+            });
+        }
+    } else if (d.ready()) {
+        if (push_button(gui, "Mirror", true)) {
+            std::string serial = d.serial;
+            defer(gui, [gui, serial] {
+                if (gui->cbs && gui->cbs->on_start_session) {
+                    gui->cbs->on_start_session(serial.c_str(),
+                                               gui->cbs_userdata);
+                }
+            });
+        }
+    }
+    if (d.ready() && !d.tcpip) {
+        if (current || d.ready()) {
+            ImGui::SameLine();
+        }
+        ImGui::BeginDisabled(gui->task_busy);
+        if (push_button(gui, SC_ICON_WIFI " Use Wi-Fi")) {
+            std::string serial = d.serial;
+            defer(gui, [gui, serial] {
+                if (gui->cbs && gui->cbs->on_switch_to_wifi) {
+                    gui->cbs->on_switch_to_wifi(serial.c_str(),
+                                                gui->cbs_userdata);
+                }
+            });
+        }
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Switch this device to wireless debugging "
+                              "(port 5555), then unplug the cable");
+    } else if (d.tcpip) {
+        if (current || d.ready()) {
+            ImGui::SameLine();
+        }
+        ImGui::BeginDisabled(gui->task_busy);
+        if (push_button(gui, SC_ICON_UNPLUG " Disconnect")) {
+            std::string serial = d.serial;
+            defer(gui, [gui, serial] {
+                if (gui->cbs && gui->cbs->on_disconnect) {
+                    gui->cbs->on_disconnect(serial.c_str(),
+                                            gui->cbs_userdata);
+                }
+            });
+        }
+        ImGui::EndDisabled();
+    }
+
+    ImGui::PopID();
+}
+
+void
+draw_wifi_card(sc_gui *gui) {
+    section_header(gui, "CONNECT OVER WI-FI");
+    if (begin_card(gui, "##wifi")) {
+        static const char *const modes[] = {"Pair with code", "Connect"};
+        segmented(gui, "wifi_mode", modes, 2, &gui->wifi_mode);
+        ImGui::Dummy(ImVec2(0, gui->s(2)));
+
+        ImGui::BeginDisabled(gui->task_busy);
+        if (gui->wifi_mode == 0) {
+            text_wrapped_colored(gui->pal.text_secondary,
+                                 "On the phone: Developer options > Wireless "
+                                 "debugging > Pair device with pairing code.");
+            input_text(gui, "##pair_address", "IP address:port",
+                       gui->pair_address, sizeof(gui->pair_address));
+            input_text(gui, "##pair_code", "Pairing code", gui->pair_code,
+                       sizeof(gui->pair_code),
+                       ImGuiInputTextFlags_CharsDecimal);
+            bool valid = *gui->pair_address && *gui->pair_code;
+            ImGui::BeginDisabled(!valid);
+            if (push_button(gui, "Pair", true)) {
+                std::string address = gui->pair_address;
+                std::string code = gui->pair_code;
+                defer(gui, [gui, address, code] {
+                    if (gui->cbs && gui->cbs->on_pair) {
+                        gui->cbs->on_pair(address.c_str(), code.c_str(),
+                                          gui->cbs_userdata);
+                    }
+                });
+                gui->pair_code[0] = '\0';
+            }
+            ImGui::EndDisabled();
+        } else {
+            text_wrapped_colored(gui->pal.text_secondary,
+                                 "Enter the IP address and port shown under "
+                                 "Wireless debugging (or IP:5555 after "
+                                 "\"Use Wi-Fi\").");
+            input_text(gui, "##connect_address", "IP address:port",
+                       gui->connect_address, sizeof(gui->connect_address));
+            ImGui::BeginDisabled(!*gui->connect_address);
+            if (push_button(gui, "Connect", true)) {
+                std::string address = gui->connect_address;
+                defer(gui, [gui, address] {
+                    if (gui->cbs && gui->cbs->on_connect) {
+                        gui->cbs->on_connect(address.c_str(),
+                                             gui->cbs_userdata);
+                    }
+                });
+            }
+            ImGui::EndDisabled();
+        }
+        ImGui::EndDisabled();
+
+        if (gui->task_busy) {
+            ImGui::SameLine();
+            spinner(gui, 9, gui->pal.text_secondary);
+        }
+    }
+    end_card();
+}
+
+void
+draw_page_devices(sc_gui *gui) {
+    page_title(gui, "Devices");
+
+    if (!gui->devices_known) {
+        spinner(gui, 9, gui->pal.text_secondary);
+        ImGui::SameLine();
+        text_colored(gui->pal.text_secondary, "Looking for devices...");
+    } else if (gui->devices.empty()) {
+        draw_onboarding(gui);
+    } else {
+        section_header(gui, "CONNECTED");
+        if (begin_card(gui, "##devices")) {
+            bool first = true;
+            for (const Device &d : gui->devices) {
+                if (!first) {
+                    ImGui::Separator();
+                }
+                first = false;
+                draw_device_row(gui, d);
+            }
+        }
+        end_card();
+    }
+
+    ImGui::Dummy(ImVec2(0, gui->s(6)));
+    draw_wifi_card(gui);
 }
 
 void
@@ -623,13 +999,9 @@ draw_page_settings(sc_gui *gui) {
     ImGui::Dummy(ImVec2(0, gui->s(6)));
     section_header(gui, "INPUT");
     if (begin_card(gui, "##input")) {
-        ImGui::PushFont(nullptr, 0);
-        text_colored(gui->pal.accent, SC_ICON_KEYBOARD);
-        ImGui::PopFont();
+        icon_text(gui->pal.accent, SC_ICON_KEYBOARD, FONT_SIZE);
         ImGui::SameLine();
-        ImGui::PushFont(gui->font_semibold, 0);
-        ImGui::TextUnformatted("Keyboard");
-        ImGui::PopFont();
+        text_semibold(gui, "Keyboard");
         text_wrapped_colored(gui->pal.text_secondary,
                              "Click the device screen to type on the device. "
                              "Click anywhere else to release the keyboard. "
@@ -673,8 +1045,61 @@ draw_pane(sc_gui *gui, float height) {
                 gui->s(1));
 }
 
-constexpr int TOOLBAR_BUTTONS = 9;
-constexpr int TOOLBAR_SEPARATORS = 3;
+// Content of the mirror area when there is no video
+void
+draw_placeholder(sc_gui *gui, float left, float width, float height) {
+    float area_h = height - gui->s(TOOLBAR_HEIGHT);
+    float block_w = std::fmin(width - gui->s(40), gui->s(300));
+    if (block_w <= 0) {
+        return;
+    }
+    float block_h = gui->s(150);
+
+    ImGui::SetNextWindowPos(ImVec2(left + (width - block_w) / 2,
+                                   (area_h - block_h) / 2));
+    ImGui::SetNextWindowSize(ImVec2(block_w, block_h));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+    ImGui::Begin("##placeholder", nullptr,
+                 PANEL_FLAGS | ImGuiWindowFlags_NoBackground
+                     | ImGuiWindowFlags_NoInputs);
+
+    const char *title;
+    const char *body;
+    if (gui->session == SC_GUI_SESSION_CONNECTING) {
+        float r = gui->s(18);
+        ImGui::SetCursorPosX((block_w - 2 * r) / 2);
+        spinner(gui, 18, gui->pal.accent);
+        title = "Connecting...";
+        body = gui->session_name.c_str();
+    } else {
+        ImGui::PushFont(nullptr, 44.f);
+        ImVec2 ts = ImGui::CalcTextSize(SC_ICON_SMARTPHONE);
+        ImGui::SetCursorPosX((block_w - ts.x) / 2);
+        text_colored(gui->pal.text_secondary, SC_ICON_SMARTPHONE);
+        ImGui::PopFont();
+        bool any_ready = false;
+        for (const Device &d : gui->devices) {
+            any_ready |= d.ready();
+        }
+        if (any_ready) {
+            title = "No device selected";
+            body = "Click Mirror next to a device in Devices.";
+        } else {
+            title = "No device connected";
+            body = "Connect a phone with USB debugging enabled, "
+                   "or connect over Wi-Fi.";
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, gui->s(4)));
+    ImGui::PushFont(gui->font_semibold, 16.f);
+    text_centered(gui->pal.text, title, block_w);
+    ImGui::PopFont();
+    text_centered(gui->pal.text_secondary, body, block_w);
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
 
 ImVec2
 toolbar_pill_size(sc_gui *gui) {
@@ -727,7 +1152,7 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     toolbar_separator(gui);
     ImGui::SameLine();
 
-    ImGui::BeginDisabled(!gui->control);
+    ImGui::BeginDisabled(!is_mirroring(gui) || !gui->control);
     if (toolbar_button(gui, "##back", SC_ICON_CHEVRON_LEFT, "Back")) {
         run_action(gui, SC_GUI_ACTION_BACK);
     }
@@ -809,15 +1234,74 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     ImGui::PopStyleVar(2);
 }
 
-Uint32 SDLCALL
-hover_timer_cb(void *userdata, SDL_TimerID, Uint32) {
-    sc_gui *gui = (sc_gui *) userdata;
-    SDL_Event event;
-    SDL_zero(event);
-    event.type = gui->redraw_event_type;
-    SDL_PushEvent(&event);
-    SDL_SetAtomicInt(&gui->hover_timer_pending, 0);
-    return 0; // one-shot
+void
+draw_toasts(sc_gui *gui, float right) {
+    Uint64 now = SDL_GetTicks();
+    for (auto it = gui->toasts.begin(); it != gui->toasts.end();) {
+        if (now >= it->expire) {
+            it = gui->toasts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    float width = gui->s(300);
+    float margin = gui->s(14);
+    float y = margin;
+    int index = 0;
+    for (auto it = gui->toasts.begin(); it != gui->toasts.end(); ++index) {
+        const Toast &t = *it;
+        char id[32];
+        snprintf(id, sizeof(id), "##toast%d", index);
+
+        ImGui::SetNextWindowPos(ImVec2(right - width - margin, y));
+        ImGui::SetNextWindowSize(ImVec2(width, 0));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, gui->pal.toolbar_bg);
+        ImGui::PushStyleColor(ImGuiCol_Border, gui->pal.toolbar_border);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, gui->s(12));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, gui->s(1));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(gui->s(14), gui->s(12)));
+        ImGui::Begin(id, nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove
+                         | ImGuiWindowFlags_NoSavedSettings
+                         | ImGuiWindowFlags_AlwaysAutoResize
+                         | ImGuiWindowFlags_NoFocusOnAppearing);
+
+        const char *icon;
+        ImU32 color;
+        switch (t.level) {
+            case SC_GUI_TOAST_SUCCESS:
+                icon = SC_ICON_CIRCLE_CHECK;
+                color = gui->pal.success;
+                break;
+            case SC_GUI_TOAST_ERROR:
+                icon = SC_ICON_CIRCLE_X;
+                color = gui->pal.error;
+                break;
+            default:
+                icon = SC_ICON_INFO;
+                color = gui->pal.accent;
+                break;
+        }
+        icon_text(color, icon, 16.f);
+        ImGui::SameLine();
+        ImGui::PushTextWrapPos(width - gui->s(14));
+        ImGui::TextUnformatted(t.text.c_str());
+        ImGui::PopTextWrapPos();
+
+        bool dismiss = ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0);
+        y += ImGui::GetWindowHeight() + gui->s(8);
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+        ImGui::PopStyleColor(2);
+
+        if (dismiss) {
+            it = gui->toasts.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void
@@ -829,8 +1313,33 @@ draw_focus_ring(sc_gui *gui, const SDL_FRect *rect) {
     ImDrawList *dl = ImGui::GetBackgroundDrawList();
     ImVec2 p0(rect->x - o, rect->y - o);
     ImVec2 p1(rect->x + rect->w + o, rect->y + rect->h + o);
-    ImU32 color = gui->pal.accent;
-    dl->AddRect(p0, p1, color, gui->s(4), 0, gui->s(2));
+    dl->AddRect(p0, p1, gui->pal.accent, gui->s(4), 0, gui->s(2));
+}
+
+Uint32 SDLCALL
+timer_cb(void *userdata, SDL_TimerID, Uint32) {
+    sc_gui *gui = (sc_gui *) userdata;
+    SDL_SetAtomicInt(&gui->timer_pending, 0);
+    push_redraw_event(gui);
+    return 0; // one-shot
+}
+
+// Schedule a low-rate redraw if something is animated or time-dependent
+void
+schedule_timer(sc_gui *gui) {
+    bool needed = ImGui::IsAnyItemHovered()
+               || !gui->toasts.empty()
+               || gui->session == SC_GUI_SESSION_CONNECTING
+               || gui->task_busy
+               || !gui->devices_known;
+    if (!needed || SDL_GetAtomicInt(&gui->timer_pending)) {
+        return;
+    }
+    SDL_SetAtomicInt(&gui->timer_pending, 1);
+    gui->timer = SDL_AddTimer(50, timer_cb, gui);
+    if (!gui->timer) {
+        SDL_SetAtomicInt(&gui->timer_pending, 0);
+    }
 }
 
 } // namespace
@@ -848,13 +1357,11 @@ sc_gui_create(const struct sc_gui_params *params) {
 
     gui->window = params->window;
     gui->renderer = params->renderer;
-    gui->device_name = params->device_name ? params->device_name : "Device";
-    gui->control = params->control;
     gui->sdl_shortcut_mods = params->sdl_shortcut_mods;
     gui->redraw_event_type = params->redraw_event_type;
     gui->cbs = params->cbs;
     gui->cbs_userdata = params->cbs_userdata;
-    SDL_SetAtomicInt(&gui->hover_timer_pending, 0);
+    SDL_SetAtomicInt(&gui->timer_pending, 0);
 
     IMGUI_CHECKVERSION();
     gui->ctx = ImGui::CreateContext();
@@ -898,8 +1405,8 @@ error_destroy_context:
 
 void
 sc_gui_destroy(struct sc_gui *gui) {
-    if (SDL_GetAtomicInt(&gui->hover_timer_pending)) {
-        SDL_RemoveTimer(gui->hover_timer);
+    if (SDL_GetAtomicInt(&gui->timer_pending)) {
+        SDL_RemoveTimer(gui->timer);
     }
     ImGui::SetCurrentContext(gui->ctx);
     ImGui_ImplSDLRenderer3_Shutdown();
@@ -929,6 +1436,12 @@ sc_gui_get_minimum_area(struct sc_gui *gui, float *width, float *height) {
     *height = gui->s(200);
 }
 
+void
+sc_gui_get_default_area(struct sc_gui *gui, float *width, float *height) {
+    *width = gui->s(DEFAULT_AREA_WIDTH);
+    *height = gui->s(DEFAULT_AREA_HEIGHT);
+}
+
 uint32_t
 sc_gui_get_background_color(struct sc_gui *gui) {
     return gui->pal.window_bg_rgb;
@@ -945,6 +1458,20 @@ bool
 sc_gui_handle_event(struct sc_gui *gui, const SDL_Event *event,
                     const SDL_FRect *mirror_rect) {
     ImGui::SetCurrentContext(gui->ctx);
+
+    // Run the callbacks requested during the last frame
+    if (!gui->pending.empty()) {
+        dispatch_pending(gui);
+        request_redraw(gui);
+    }
+
+    if (event->type == gui->redraw_event_type) {
+        // Render one frame (do not reset settle_frames, or redraws would
+        // never stop)
+        gui->redraw_requested = true;
+        return true;
+    }
+
     ImGui_ImplSDL3_ProcessEvent(event);
 
     ImGuiIO &io = ImGui::GetIO();
@@ -971,13 +1498,13 @@ sc_gui_handle_event(struct sc_gui *gui, const SDL_Event *event,
                 if (!SDL_GetMouseState(nullptr, nullptr)) {
                     gui->mirror_drag = false;
                 }
-                return false;
+                return !mirror_rect;
             }
             request_redraw(gui);
             return true;
         case SDL_EVENT_MOUSE_MOTION: {
             if (gui->mirror_drag) {
-                return false;
+                return !mirror_rect;
             }
             request_redraw(gui);
             bool on_mirror =
@@ -994,7 +1521,7 @@ sc_gui_handle_event(struct sc_gui *gui, const SDL_Event *event,
         }
         case SDL_EVENT_KEY_DOWN:
         case SDL_EVENT_KEY_UP:
-            if (io.WantTextInput) {
+            if (io.WantTextInput || !mirror_rect) {
                 request_redraw(gui);
                 return true;
             }
@@ -1009,17 +1536,26 @@ sc_gui_handle_event(struct sc_gui *gui, const SDL_Event *event,
             return true;
         case SDL_EVENT_TEXT_INPUT:
         case SDL_EVENT_TEXT_EDITING:
-            if (io.WantTextInput || !gui->mirror_focused) {
+            if (io.WantTextInput || !gui->mirror_focused || !mirror_rect) {
                 request_redraw(gui);
                 return true;
             }
             return false;
+        case SDL_EVENT_DROP_BEGIN:
+        case SDL_EVENT_DROP_POSITION:
+        case SDL_EVENT_DROP_COMPLETE:
+        case SDL_EVENT_DROP_FILE:
+        case SDL_EVENT_DROP_TEXT:
+            // Files can only be dropped while mirroring
+            return !mirror_rect;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             gui->mirror_drag = false;
             request_redraw(gui);
             return false;
         case SDL_EVENT_WINDOW_MOUSE_LEAVE:
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        case SDL_EVENT_WINDOW_EXPOSED:
+        case SDL_EVENT_WINDOW_RESIZED:
             request_redraw(gui);
             return false;
         case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
@@ -1046,35 +1582,77 @@ sc_gui_render(struct sc_gui *gui, const SDL_FRect *mirror_rect) {
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
 
+    ImVec2 display = ImGui::GetIO().DisplaySize;
     if (!is_fullscreen(gui)) {
-        ImVec2 display = ImGui::GetIO().DisplaySize;
         sc_gui_insets insets = sc_gui_get_insets(gui);
         if (gui->sidebar_visible) {
             draw_nav(gui, display.y);
             draw_pane(gui, display.y);
         }
+        if (!mirror_rect) {
+            draw_placeholder(gui, insets.left, display.x - insets.left,
+                             display.y);
+        }
         draw_toolbar(gui, insets.left, display.x - insets.left, display.y);
         draw_focus_ring(gui, mirror_rect);
     }
+    draw_toasts(gui, display.x);
 
     ImGui::Render();
     ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(),
                                           gui->renderer);
 
-    if (gui->settle_frames > 0) {
-        --gui->settle_frames;
-        SDL_Event event;
-        SDL_zero(event);
-        event.type = gui->redraw_event_type;
-        SDL_PushEvent(&event);
-    } else if (ImGui::IsAnyItemHovered()
-            && !SDL_GetAtomicInt(&gui->hover_timer_pending)) {
-        SDL_SetAtomicInt(&gui->hover_timer_pending, 1);
-        gui->hover_timer = SDL_AddTimer(100, hover_timer_cb, gui);
-        if (!gui->hover_timer) {
-            SDL_SetAtomicInt(&gui->hover_timer_pending, 0);
+    if (gui->settle_frames > 0 || !gui->pending.empty()) {
+        if (gui->settle_frames > 0) {
+            --gui->settle_frames;
         }
+        push_redraw_event(gui);
+    } else {
+        schedule_timer(gui);
     }
+}
+
+void
+sc_gui_set_devices(struct sc_gui *gui, const struct sc_gui_device *devices,
+                   size_t count) {
+    gui->devices.clear();
+    for (size_t i = 0; i < count; ++i) {
+        const sc_gui_device &d = devices[i];
+        gui->devices.push_back({d.serial ? d.serial : "",
+                                d.model ? d.model : "",
+                                d.state ? d.state : "",
+                                d.tcpip});
+    }
+    gui->devices_known = true;
+    request_redraw(gui);
+}
+
+void
+sc_gui_set_session(struct sc_gui *gui, enum sc_gui_session_state state,
+                   const char *serial, const char *device_name, bool control) {
+    gui->session = state;
+    gui->session_serial = serial ? serial : "";
+    gui->session_name = device_name ? device_name
+                      : serial ? serial : "";
+    gui->control = control;
+    if (state != SC_GUI_SESSION_RUNNING) {
+        gui->mirror_focused = false;
+        gui->mirror_drag = false;
+    }
+    request_redraw(gui);
+}
+
+void
+sc_gui_show_toast(struct sc_gui *gui, enum sc_gui_toast_level level,
+                  const char *text) {
+    add_toast(gui, level, text);
+    request_redraw(gui);
+}
+
+void
+sc_gui_set_task_busy(struct sc_gui *gui, bool busy) {
+    gui->task_busy = busy;
+    request_redraw(gui);
 }
 
 } // extern "C"

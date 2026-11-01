@@ -86,6 +86,22 @@ bool
 sc_adb_connect(struct sc_intr *intr, const char *ip_port, unsigned flags);
 
 /**
+ * Execute `adb pair <ip_port> <code>` (Android 11+ wireless debugging)
+ */
+bool
+sc_adb_pair(struct sc_intr *intr, const char *ip_port, const char *code,
+            unsigned flags);
+
+/**
+ * Execute `adb devices -l` and parse the result
+ *
+ * The devices must be destroyed by the caller with sc_adb_devices_destroy().
+ */
+bool
+sc_adb_list_devices(struct sc_intr *intr, unsigned flags,
+                    struct sc_vec_adb_devices *out_vec);
+
+/**
  * Execute `adb disconnect [<ip_port>]`
  *
  * If `ip_port` is NULL, execute `adb disconnect`.

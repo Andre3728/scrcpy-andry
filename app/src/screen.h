@@ -113,6 +113,9 @@ struct sc_screen {
         struct sc_size size;
     } resize_tracker;
 
+    // scrcpy-gui: the window, renderer and GUI are owned by the GUI app and
+    // outlive the screen
+    bool hosted;
     // scrcpy-gui panel (NULL if disabled)
     struct sc_gui *gui;
     // GUI insets currently applied to the window size
@@ -157,7 +160,11 @@ struct sc_screen_params {
     bool fullscreen;
     bool start_fps_counter;
 
-    bool gui; // show the scrcpy-gui panel
+    // scrcpy-gui: if set, use this window and renderer (owned by the GUI
+    // app) instead of creating them, and draw the GUI
+    SDL_Window *host_window;
+    SDL_Renderer *host_renderer;
+    struct sc_gui *gui;
 };
 
 // initialize screen, create window, renderer and texture (window is hidden)
@@ -176,6 +183,15 @@ sc_screen_join(struct sc_screen *screen);
 // destroy window, renderer and texture (if any)
 void
 sc_screen_destroy(struct sc_screen *screen);
+
+// scrcpy-gui: run a toolbar/menu action
+void
+sc_screen_handle_gui_action(struct sc_screen *screen,
+                            enum sc_gui_action action);
+
+// scrcpy-gui: the GUI insets changed (e.g. the sidebar was toggled)
+void
+sc_screen_handle_gui_insets_changed(struct sc_screen *screen);
 
 // hide the window
 //

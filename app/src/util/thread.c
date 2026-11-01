@@ -154,10 +154,17 @@ sc_cond_timedwait(sc_cond *cond, sc_mutex *mutex, sc_tick deadline) {
         return false; // timeout
     }
 
-    // Round up to the next millisecond to guarantee that the deadline is
-    // reached when returning due to timeout
-    uint32_t ms = SC_TICK_TO_MS(deadline - now + SC_TICK_FROM_MS(1) - 1);
-    bool signaled = SDL_WaitConditionTimeout(cond->cond, mutex->mutex, ms);
+    bool signaled;
+    do {
+        // Round up to the next millisecond to guarantee that the deadline is
+        // reached when returning due to timeout
+        uint32_t ms = SC_TICK_TO_MS(deadline - now + SC_TICK_FROM_MS(1) - 1);
+        signaled = SDL_WaitConditionTimeout(cond->cond, mutex->mutex, ms);
+        // The system timer may be less precise than sc_tick_now() (notably on
+        // Windows), so a timeout may be reported slightly before the deadline:
+        // wait again for the remaining time
+        now = sc_tick_now();
+    } while (!signaled && now < deadline);
 #ifndef NDEBUG
     atomic_store_explicit(&mutex->locker, sc_thread_get_id(),
                           memory_order_relaxed);

@@ -27,9 +27,27 @@
 #define SC_ADB_COMMAND(...) { sc_adb_get_executable(), __VA_ARGS__, NULL }
 
 static char *adb_executable;
+// sc_adb_init() may be called several times (by the GUI app and by each
+// server session), only the first call initializes
+static unsigned adb_init_count;
+
+static bool
+sc_adb_init_executable(void);
 
 bool
 sc_adb_init(void) {
+    if (adb_init_count++) {
+        return true;
+    }
+    if (!sc_adb_init_executable()) {
+        adb_init_count = 0;
+        return false;
+    }
+    return true;
+}
+
+static bool
+sc_adb_init_executable(void) {
     adb_executable = sc_get_env("ADB");
     if (adb_executable) {
         LOGD("Using adb: %s", adb_executable);
@@ -60,7 +78,12 @@ sc_adb_init(void) {
 
 void
 sc_adb_destroy(void) {
+    assert(adb_init_count);
+    if (--adb_init_count) {
+        return;
+    }
     free(adb_executable);
+    adb_executable = NULL;
 }
 
 const char *
@@ -411,6 +434,42 @@ sc_adb_connect(struct sc_intr *intr, const char *ip_port, unsigned flags) {
 }
 
 bool
+sc_adb_pair(struct sc_intr *intr, const char *ip_port, const char *code,
+            unsigned flags) {
+    assert(ip_port && code);
+    const char *const argv[] = SC_ADB_COMMAND("pair", ip_port, code);
+
+    sc_pipe pout;
+    sc_pid pid = sc_adb_execute_p(argv, flags, &pout);
+    if (pid == SC_PROCESS_NONE) {
+        LOGE("Could not execute \"adb pair\"");
+        return false;
+    }
+
+    // Like "adb connect", "adb pair" may return 0 on failure: check that the
+    // output contains "Successfully paired"
+    char buf[256];
+    ssize_t r = sc_pipe_read_all_intr(intr, pid, pout, buf, sizeof(buf) - 1);
+    sc_pipe_close(pout);
+
+    bool ok = process_check_success_intr(intr, pid, "adb pair", flags);
+    if (!ok || r == -1) {
+        return false;
+    }
+
+    assert((size_t) r < sizeof(buf));
+    buf[r] = '\0';
+
+    ok = strstr(buf, "Successfully paired") != NULL;
+    if (!ok && !(flags & SC_ADB_NO_STDERR)) {
+        size_t len = strcspn(buf, "\r\n");
+        buf[len] = '\0';
+        fprintf(stderr, "%s\n", buf);
+    }
+    return ok;
+}
+
+bool
 sc_adb_disconnect(struct sc_intr *intr, const char *ip_port, unsigned flags) {
     assert(ip_port);
     const char *const argv[] = SC_ADB_COMMAND("disconnect", ip_port);
@@ -419,7 +478,7 @@ sc_adb_disconnect(struct sc_intr *intr, const char *ip_port, unsigned flags) {
     return process_check_success_intr(intr, pid, "adb disconnect", flags);
 }
 
-static bool
+bool
 sc_adb_list_devices(struct sc_intr *intr, unsigned flags,
                     struct sc_vec_adb_devices *out_vec) {
     const char *const argv[] = SC_ADB_COMMAND("devices", "-l");

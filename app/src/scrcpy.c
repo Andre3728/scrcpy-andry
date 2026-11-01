@@ -118,10 +118,16 @@ sdl_configure_ctrl_c_windows(void) {
 #endif // _WIN32
 
 static enum scrcpy_exit_code
-event_loop(struct scrcpy *s, bool has_screen) {
+event_loop(struct scrcpy *s, bool has_screen, struct scrcpy_gui_host *host) {
     SDL_Event event;
     while (SDL_WaitEvent(&event)) {
+        if (host && host->handle_event(&event, has_screen, host->userdata)) {
+            continue;
+        }
         switch (event.type) {
+            case SC_EVENT_GUI_STOP_SESSION:
+                LOGD("GUI requested to stop the session");
+                return SCRCPY_EXIT_SUCCESS;
             case SC_EVENT_DEVICE_DISCONNECTED:
                 LOGW("Device disconnected");
                 if (has_screen) {
@@ -148,6 +154,9 @@ event_loop(struct scrcpy *s, bool has_screen) {
                 return SCRCPY_EXIT_SUCCESS;
             case SDL_EVENT_QUIT:
                 LOGD("User requested to quit");
+                if (host) {
+                    host->quit_requested = true;
+                }
                 return SCRCPY_EXIT_SUCCESS;
             default:
                 if (has_screen) {
@@ -161,11 +170,19 @@ event_loop(struct scrcpy *s, bool has_screen) {
 
 // Return true on success, false on error
 static bool
-await_for_server(bool *connected) {
+await_for_server(bool *connected, struct scrcpy_gui_host *host) {
     SDL_Event event;
     while (SDL_WaitEvent(&event)) {
+        if (host && host->handle_event(&event, false, host->userdata)) {
+            continue;
+        }
         switch (event.type) {
             case SDL_EVENT_QUIT:
+                if (host) {
+                    host->quit_requested = true;
+                }
+                // fall through
+            case SC_EVENT_GUI_STOP_SESSION:
                 if (connected) {
                     *connected = false;
                 }
@@ -375,6 +392,11 @@ sc_init_video_hwdec(struct sc_hwdec *hwdec, enum sc_hwdec_mode mode,
 
 enum scrcpy_exit_code
 scrcpy(struct scrcpy_options *options) {
+    return scrcpy_run(options, NULL);
+}
+
+enum scrcpy_exit_code
+scrcpy_run(struct scrcpy_options *options, struct scrcpy_gui_host *host) {
     static struct scrcpy scrcpy;
 #ifndef NDEBUG
     // Detect missing initializations
@@ -388,7 +410,10 @@ scrcpy(struct scrcpy_options *options) {
         return SCRCPY_EXIT_FAILURE;
     }
 
-    atexit(SDL_Quit);
+    if (!host) {
+        // The GUI app does it once for all sessions
+        atexit(SDL_Quit);
+    }
 
     enum scrcpy_exit_code ret = SCRCPY_EXIT_FAILURE;
 
@@ -496,13 +521,17 @@ scrcpy(struct scrcpy_options *options) {
         return SCRCPY_EXIT_FAILURE;
     }
 
+    if (!host) {
+        // The GUI app does it once for all sessions
 #ifdef _WIN32
-    sdl_configure_ctrl_c_windows();
+        sdl_configure_ctrl_c_windows();
 #endif
 
-    // Set hints before starting the server thread to avoid race conditions in
-    // SDL
-    sc_sdl_set_hints(options->render_driver, options->disable_screensaver);
+        // Set hints before starting the server thread to avoid race
+        // conditions in SDL
+        sc_sdl_set_hints(options->render_driver,
+                         options->disable_screensaver);
+    }
 
     if (!sc_server_start(&s->server)) {
         goto end;
@@ -511,7 +540,7 @@ scrcpy(struct scrcpy_options *options) {
     server_started = true;
 
     if (options->list) {
-        bool ok = await_for_server(NULL);
+        bool ok = await_for_server(NULL, host);
         ret = ok ? SCRCPY_EXIT_SUCCESS : SCRCPY_EXIT_FAILURE;
         goto end;
     }
@@ -553,7 +582,7 @@ scrcpy(struct scrcpy_options *options) {
 
     // Await for server without blocking Ctrl+C handling
     bool connected;
-    if (!await_for_server(&connected)) {
+    if (!await_for_server(&connected, host)) {
         LOGE("Server connection failed");
         goto end;
     }
@@ -841,13 +870,19 @@ aoa_complete:
             .hwdec_mode = options->hwdec_mode,
             .fullscreen = options->fullscreen,
             .start_fps_counter = options->start_fps_counter,
-            .gui = options->gui,
+            .host_window = host ? host->window : NULL,
+            .host_renderer = host ? host->renderer : NULL,
+            .gui = host ? host->gui : NULL,
         };
 
         if (!sc_screen_init(&s->screen, &screen_params)) {
             goto end;
         }
         screen_initialized = true;
+
+        if (host && host->on_screen) {
+            host->on_screen(&s->screen, host->userdata);
+        }
     }
 
     bool needs_video_decoder = options->video_playback;
@@ -1037,7 +1072,7 @@ aoa_complete:
         }
     }
 
-    ret = event_loop(s, options->window);
+    ret = event_loop(s, options->window, host);
 
     // Reject all new runnables, and execute the pending ones now
     // (they could access memory that will be cleaned up below)
@@ -1082,6 +1117,9 @@ end:
         sc_recorder_stop(&s->recorder);
     }
     if (screen_initialized) {
+        if (host && host->on_screen) {
+            host->on_screen(NULL, host->userdata);
+        }
         sc_screen_interrupt(&s->screen);
     }
 

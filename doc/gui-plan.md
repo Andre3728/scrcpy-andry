@@ -207,6 +207,32 @@ Each milestone is usable and mergeable on its own.
 - Known gaps: the disconnection screen (`sc_screen_handle_disconnection`)
   does not redraw the GUI; that loop is replaced in M2.
 
+### M2 — Device lifecycle (implemented)
+
+- `app/src/gui_app.c` (`scrcpy_gui()`): owns the window, renderer and GUI;
+  runs sessions with `scrcpy_run(options, host)` and returns to the device
+  list when a session ends. Used for no-arg launch and `--gui`.
+- `struct scrcpy_gui_host` (`scrcpy.h`): the session borrows the app's window,
+  renderer and GUI ("hosted" screen), and forwards events to the app while
+  waiting for the server so the UI stays live during connection.
+- Worker thread: polls `adb devices -l` every 2 s and runs device tasks
+  (Use Wi-Fi = `adb tcpip 5555` + connect, pair with code, connect,
+  disconnect). Results come back as `SC_EVENT_GUI_DEVICES` /
+  `SC_EVENT_GUI_TASK_DONE`.
+- Auto-start: the `-s` device, else the only ready device. A device stopped by
+  the user or that failed is not auto-started again until it disappears.
+- Auto-reconnect after a disconnection (verified with `adb kill-server`
+  mid-session); after "Use Wi-Fi", the app reconnects to the Wi-Fi address.
+- Devices page: device rows (USB/Wi-Fi, state, unauthorized/offline hints,
+  Mirror / Stop / Use Wi-Fi / Disconnect), onboarding card when empty,
+  Wi-Fi card (pair with code / connect). Placeholder in the mirror area when
+  idle or connecting. Toasts for results.
+- GUI callbacks are deferred out of rendering (dispatched on the next event).
+- Core fixes: `sc_adb_init()` is reference-counted; `sc_cond_timedwait()`
+  waits again when the OS reports a timeout before the deadline (it asserted
+  on Windows); the screen removes its event watcher on destroy.
+- Not verified yet (needs hands-on): Stop/Mirror buttons, Use Wi-Fi, pairing.
+
 
 ## Build and test
 

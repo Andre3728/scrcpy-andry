@@ -23,6 +23,12 @@ enum {
     SC_EVENT_DISCONNECTED_ICON_LOADED,
     SC_EVENT_DISCONNECTED_TIMEOUT,
     SC_EVENT_GUI_REDRAW,
+    // The GUI requested to stop the current mirroring session
+    SC_EVENT_GUI_STOP_SESSION,
+    // The device monitor listed devices (data1: struct sc_vec_adb_devices *)
+    SC_EVENT_GUI_DEVICES,
+    // A GUI background task completed (data1: struct sc_gui_task *)
+    SC_EVENT_GUI_TASK_DONE,
 };
 
 bool
@@ -47,5 +53,9 @@ sc_run_on_main_thread(sc_runnable_fn run, void *userdata, bool wait_complete);
 // Reject new runnables after this call
 void
 sc_main_thread_stop(void);
+
+// Accept runnables again after sc_main_thread_stop() (for a new session)
+void
+sc_main_thread_resume(void);
 
 #endif

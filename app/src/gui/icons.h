@@ -31,5 +31,15 @@
 #define SC_ICON_USB                ""
 #define SC_ICON_VOLUME_1           ""
 #define SC_ICON_VOLUME_2           ""
+#define SC_ICON_WIFI               ""
+#define SC_ICON_WIFI_OFF           ""
+#define SC_ICON_LINK               ""
+#define SC_ICON_TRIANGLE_ALERT     ""
+#define SC_ICON_X                  ""
+#define SC_ICON_CABLE              ""
+#define SC_ICON_LOADER             ""
+#define SC_ICON_CIRCLE_CHECK       ""
+#define SC_ICON_CIRCLE_X           ""
+#define SC_ICON_UNPLUG             ""
 
 #endif
