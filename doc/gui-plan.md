@@ -254,6 +254,27 @@ Each milestone is usable and mergeable on its own.
   splitting). Verified on device: a profile with max size 800 and
   `--no-audio --max-fps=30` gives a 384x800 stream without audio.
 
+### M4 — Drop, install and transfers (implemented, drag & drop needs hands-on)
+
+- In GUI mode the GUI handles the SDL drop events itself (the upstream file
+  pusher is bypassed): drop anywhere in the window while mirroring. APKs are
+  installed (`adb install -r`), other files and folders are copied
+  (`adb push`, recursive) to `--push-target` (default `/sdcard/Download/`).
+- Overlay during the drag (card over the mirror area). SDL only provides the
+  file names on drop, so the overlay describes the rule ("APKs are installed,
+  other files go to /sdcard/Download") rather than counting files.
+- Transfer thread (separate from the device poller): one transfer at a time,
+  cancel (pending: dequeued; running: the adb process is killed). Progress
+  is per file (waiting / installing / done / failed): adb does not print
+  byte progress when its output is not a terminal.
+- Transfers popover on the toolbar (badge with the active count, opens
+  automatically on drop, Clear), summary toast per batch, readable install
+  errors (`INSTALL_FAILED_VERSION_DOWNGRADE` → "A newer version is already
+  installed", ...).
+- `sc_adb_run_capture()` (adb.c) captures stdout + stderr of an adb command.
+- Pure helpers in `gui_util.c` with unit test `test_gui_util` (error
+  extraction checked against real `adb install` output from the device).
+
 
 ## Build and test
 

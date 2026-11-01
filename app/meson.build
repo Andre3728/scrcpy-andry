@@ -22,6 +22,7 @@ src = [
     'src/frame_buffer.c',
     'src/gui_app.c',
     'src/gui_config.c',
+    'src/gui_util.c',
     'src/hwdec.c',
     'src/icon.c',
     'src/input_manager.c',
@@ -400,6 +401,16 @@ if get_option('buildtype') == 'debug'
         link_with: cjson_lib,
         c_args: ['-DSC_TEST'])
     test('test_gui_config', test_gui_config)
+
+    test_gui_util = executable('test_gui_util', [
+            'tests/test_gui_util.c',
+            'src/gui_util.c',
+            'src/compat.c',
+        ],
+        include_directories: src_dir,
+        dependencies: dependencies,
+        c_args: ['-DSC_TEST'])
+    test('test_gui_util', test_gui_util)
 endif
 
 if meson.version().version_compare('>= 0.58.0')

@@ -79,6 +79,19 @@ struct sc_gui_prefs {
     char adb_path[512]; // empty: default
 };
 
+enum sc_gui_transfer_type {
+    SC_GUI_TRANSFER_INSTALL, // adb install
+    SC_GUI_TRANSFER_PUSH,    // adb push
+};
+
+enum sc_gui_transfer_state {
+    SC_GUI_TRANSFER_PENDING,
+    SC_GUI_TRANSFER_RUNNING,
+    SC_GUI_TRANSFER_DONE,
+    SC_GUI_TRANSFER_FAILED,
+    SC_GUI_TRANSFER_CANCELED,
+};
+
 struct sc_gui_callbacks {
     // A toolbar/menu action was triggered (only while mirroring)
     void (*on_action)(enum sc_gui_action action, void *userdata);
@@ -99,6 +112,13 @@ struct sc_gui_callbacks {
                                bool restart, void *userdata);
     void (*on_prefs_changed)(const struct sc_gui_prefs *prefs,
                              void *userdata);
+
+    // Files were dropped while mirroring. remote_dir is the destination
+    // folder on the device, or NULL for the default behavior (install APKs,
+    // copy the other files to /sdcard/Download/).
+    void (*on_drop_files)(const char *const *paths, size_t count,
+                          const char *remote_dir, void *userdata);
+    void (*on_cancel_transfer)(uint32_t id, void *userdata);
 };
 
 struct sc_gui_params {
@@ -198,6 +218,12 @@ sc_gui_set_profile(struct sc_gui *gui, const struct sc_gui_profile *profile,
 // Set the application preferences (the data is copied)
 void
 sc_gui_set_prefs(struct sc_gui *gui, const struct sc_gui_prefs *prefs);
+
+// Add or update a transfer (install or copy) shown in the Transfers popover
+void
+sc_gui_update_transfer(struct sc_gui *gui, uint32_t id,
+                       enum sc_gui_transfer_type type, const char *name,
+                       enum sc_gui_transfer_state state, const char *detail);
 
 // Indicate that a background device task (Wi-Fi switch, pairing...) is running
 void

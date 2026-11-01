@@ -29,6 +29,8 @@ enum {
     SC_EVENT_GUI_DEVICES,
     // A GUI background task completed (data1: struct sc_gui_task *)
     SC_EVENT_GUI_TASK_DONE,
+    // A transfer changed state (data1: struct sc_gui_transfer_update *)
+    SC_EVENT_GUI_TRANSFER,
 };
 
 bool

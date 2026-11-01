@@ -17,6 +17,7 @@
 #include "events.h"
 #include "gui/gui.h"
 #include "gui_config.h"
+#include "gui_util.h"
 #include "icon.h"
 #include "screen.h"
 #include "sdl_hints.h"
@@ -52,6 +53,23 @@ struct sc_gui_task {
     struct sc_gui_task *next;
 };
 
+// An install or a copy, executed by the transfer thread
+struct sc_gui_transfer_job {
+    uint32_t id;
+    enum sc_gui_transfer_type type;
+    char *serial;
+    char *local;
+    char *remote_dir; // PUSH only, ends with '/'
+    struct sc_gui_transfer_job *next;
+};
+
+struct sc_gui_transfer_update {
+    uint32_t id;
+    enum sc_gui_transfer_type type;
+    enum sc_gui_transfer_state state;
+    char detail[256];
+};
+
 struct sc_gui_app {
     // Options from the command line, the base for every session
     struct scrcpy_options *options;
@@ -77,6 +95,19 @@ struct sc_gui_app {
     bool stopped; // protected by mutex
     bool refresh_requested; // protected by mutex
     struct sc_gui_task *tasks; // protected by mutex
+
+    // Transfer thread: installs and copies, one at a time
+    sc_thread transfer_thread;
+    sc_cond transfer_cond;
+    struct sc_intr transfer_intr; // reset after each transfer
+    struct sc_gui_transfer_job *jobs; // pending, protected by mutex
+    uint32_t running_transfer; // 0 if none, protected by mutex
+    uint32_t next_transfer_id;
+    // Summary of the current batch (main thread)
+    unsigned active_transfers;
+    unsigned batch_installed;
+    unsigned batch_copied;
+    unsigned batch_failed;
 
     // Last device list (owned)
     struct sc_vec_adb_devices devices;
@@ -351,6 +382,255 @@ submit_task(struct sc_gui_app *app, enum sc_gui_task_type type,
     sc_gui_set_task_busy(app->gui, true);
 }
 
+// ---------------------------------------------------------------- transfers
+
+static void
+sc_gui_transfer_job_destroy(struct sc_gui_transfer_job *job) {
+    free(job->serial);
+    free(job->local);
+    free(job->remote_dir);
+    free(job);
+}
+
+static void
+run_transfer(struct sc_gui_app *app, struct sc_gui_transfer_job *job,
+             struct sc_gui_transfer_update *u) {
+    char out[4096];
+    bool ok;
+    if (job->type == SC_GUI_TRANSFER_INSTALL) {
+        const char *const args[] = {"-s", job->serial, "install", "-r",
+                                    job->local, NULL};
+        ok = sc_adb_run_capture(&app->transfer_intr, args, out, sizeof(out));
+        // Old adb versions return 0 on failure
+        ok = ok && !strstr(out, "Failure");
+    } else {
+        const char *const args[] = {"-s", job->serial, "push", job->local,
+                                    job->remote_dir, NULL};
+        ok = sc_adb_run_capture(&app->transfer_intr, args, out, sizeof(out));
+    }
+
+    if (sc_intr_is_interrupted(&app->transfer_intr)) {
+        u->state = SC_GUI_TRANSFER_CANCELED;
+        return;
+    }
+
+    if (ok) {
+        u->state = SC_GUI_TRANSFER_DONE;
+        if (job->type == SC_GUI_TRANSFER_INSTALL) {
+            snprintf(u->detail, sizeof(u->detail), "Installed");
+        } else {
+            snprintf(u->detail, sizeof(u->detail), "Copied to %s",
+                     job->remote_dir);
+        }
+    } else {
+        u->state = SC_GUI_TRANSFER_FAILED;
+        sc_gui_adb_error(out, u->detail, sizeof(u->detail));
+        LOGW("Transfer failed (%s): %s", job->local, out);
+    }
+}
+
+static void
+post_transfer_update(uint32_t id, enum sc_gui_transfer_type type,
+                     enum sc_gui_transfer_state state, const char *detail) {
+    struct sc_gui_transfer_update *u = calloc(1, sizeof(*u));
+    if (!u) {
+        LOG_OOM();
+        return;
+    }
+    u->id = id;
+    u->type = type;
+    u->state = state;
+    if (detail) {
+        snprintf(u->detail, sizeof(u->detail), "%s", detail);
+    }
+    if (!sc_push_event_with_data(SC_EVENT_GUI_TRANSFER, u)) {
+        free(u);
+    }
+}
+
+static int
+run_transfer_thread(void *data) {
+    struct sc_gui_app *app = data;
+
+    sc_mutex_lock(&app->mutex);
+    for (;;) {
+        while (!app->stopped && !app->jobs) {
+            sc_cond_wait(&app->transfer_cond, &app->mutex);
+        }
+        if (app->stopped) {
+            break;
+        }
+
+        struct sc_gui_transfer_job *job = app->jobs;
+        app->jobs = job->next;
+        job->next = NULL;
+        app->running_transfer = job->id;
+        sc_mutex_unlock(&app->mutex);
+
+        post_transfer_update(job->id, job->type, SC_GUI_TRANSFER_RUNNING,
+                             NULL);
+
+        struct sc_gui_transfer_update *u = calloc(1, sizeof(*u));
+        if (u) {
+            u->id = job->id;
+            u->type = job->type;
+            run_transfer(app, job, u);
+            if (!sc_push_event_with_data(SC_EVENT_GUI_TRANSFER, u)) {
+                free(u);
+            }
+        } else {
+            LOG_OOM();
+        }
+        sc_gui_transfer_job_destroy(job);
+
+        sc_mutex_lock(&app->mutex);
+        app->running_transfer = 0;
+        // Reset the interruptor for the next transfer (a cancellation
+        // interrupts it permanently)
+        sc_intr_destroy(&app->transfer_intr);
+        if (!sc_intr_init(&app->transfer_intr)) {
+            LOGE("Could not reset the transfer interruptor");
+            app->stopped = true;
+        }
+    }
+    sc_mutex_unlock(&app->mutex);
+
+    return 0;
+}
+
+static void
+enqueue_transfer(struct sc_gui_app *app, const char *local,
+                 const char *remote_dir) {
+    SDL_PathInfo info;
+    bool is_file = SDL_GetPathInfo(local, &info)
+                && info.type == SDL_PATHTYPE_FILE;
+
+    struct sc_gui_transfer_job *job = calloc(1, sizeof(*job));
+    if (!job) {
+        LOG_OOM();
+        return;
+    }
+    job->id = ++app->next_transfer_id;
+    job->type = !remote_dir && is_file && sc_gui_is_apk(local)
+              ? SC_GUI_TRANSFER_INSTALL : SC_GUI_TRANSFER_PUSH;
+    job->serial = strdup(app->session_serial);
+    job->local = strdup(local);
+
+    if (job->type == SC_GUI_TRANSFER_PUSH) {
+        const char *dir = remote_dir ? remote_dir
+                        : app->options->push_target ? app->options->push_target
+                        : "/sdcard/Download/";
+        size_t len = strlen(dir);
+        bool slash = len && dir[len - 1] == '/';
+        job->remote_dir = sc_str_concat(dir, slash ? "" : "/");
+    }
+
+    if (!job->serial || !job->local
+            || (job->type == SC_GUI_TRANSFER_PUSH && !job->remote_dir)) {
+        LOG_OOM();
+        sc_gui_transfer_job_destroy(job);
+        return;
+    }
+
+    sc_gui_update_transfer(app->gui, job->id, job->type,
+                           sc_gui_path_basename(local), SC_GUI_TRANSFER_PENDING,
+                           NULL);
+    ++app->active_transfers;
+
+    sc_mutex_lock(&app->mutex);
+    struct sc_gui_transfer_job **tail = &app->jobs;
+    while (*tail) {
+        tail = &(*tail)->next;
+    }
+    *tail = job;
+    sc_cond_signal(&app->transfer_cond);
+    sc_mutex_unlock(&app->mutex);
+}
+
+static void
+on_transfer_update(struct sc_gui_app *app, struct sc_gui_transfer_update *u) {
+    sc_gui_update_transfer(app->gui, u->id, u->type, NULL, u->state,
+                           u->detail[0] ? u->detail : NULL);
+
+    bool finished = u->state == SC_GUI_TRANSFER_DONE
+                 || u->state == SC_GUI_TRANSFER_FAILED
+                 || u->state == SC_GUI_TRANSFER_CANCELED;
+    if (finished) {
+        if (u->state == SC_GUI_TRANSFER_DONE) {
+            if (u->type == SC_GUI_TRANSFER_INSTALL) {
+                ++app->batch_installed;
+            } else {
+                ++app->batch_copied;
+            }
+        } else if (u->state == SC_GUI_TRANSFER_FAILED) {
+            ++app->batch_failed;
+        }
+        assert(app->active_transfers);
+        --app->active_transfers;
+    }
+    free(u);
+
+    if (finished && !app->active_transfers) {
+        // The batch is complete: summarize
+        char msg[256];
+        unsigned total = app->batch_installed + app->batch_copied
+                       + app->batch_failed;
+        if (app->batch_failed) {
+            snprintf(msg, sizeof(msg), "%u of %u transfers failed. See "
+                     "Transfers for details.", app->batch_failed, total);
+            sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR, msg);
+        } else if (app->batch_installed || app->batch_copied) {
+            if (app->batch_installed && app->batch_copied) {
+                snprintf(msg, sizeof(msg), "Installed %u app(s) and copied "
+                         "%u file(s).", app->batch_installed,
+                         app->batch_copied);
+            } else if (app->batch_installed) {
+                snprintf(msg, sizeof(msg), "Installed %u app(s).",
+                         app->batch_installed);
+            } else {
+                snprintf(msg, sizeof(msg), "Copied %u file(s).",
+                         app->batch_copied);
+            }
+            sc_gui_show_toast(app->gui, SC_GUI_TOAST_SUCCESS, msg);
+        }
+        app->batch_installed = 0;
+        app->batch_copied = 0;
+        app->batch_failed = 0;
+    }
+}
+
+static void
+cancel_transfer(struct sc_gui_app *app, uint32_t id) {
+    sc_mutex_lock(&app->mutex);
+    if (app->running_transfer == id) {
+        // The transfer thread reports the cancellation
+        sc_intr_interrupt(&app->transfer_intr);
+        sc_mutex_unlock(&app->mutex);
+        return;
+    }
+
+    struct sc_gui_transfer_job *removed = NULL;
+    for (struct sc_gui_transfer_job **p = &app->jobs; *p; p = &(*p)->next) {
+        if ((*p)->id == id) {
+            removed = *p;
+            *p = removed->next;
+            break;
+        }
+    }
+    sc_mutex_unlock(&app->mutex);
+
+    if (removed) {
+        struct sc_gui_transfer_update *u = calloc(1, sizeof(*u));
+        if (u) {
+            u->id = id;
+            u->type = removed->type;
+            u->state = SC_GUI_TRANSFER_CANCELED;
+            on_transfer_update(app, u);
+        }
+        sc_gui_transfer_job_destroy(removed);
+    }
+}
+
 // ---------------------------------------------------------------- rendering
 
 static void
@@ -613,6 +893,9 @@ handle_app_event(struct sc_gui_app *app, const SDL_Event *event) {
         case SC_EVENT_GUI_TASK_DONE:
             on_task_done(app, event->user.data1);
             return true;
+        case SC_EVENT_GUI_TRANSFER:
+            on_transfer_update(app, event->user.data1);
+            return true;
         default:
             return false;
     }
@@ -713,6 +996,24 @@ cb_on_profile_changed(const struct sc_gui_profile *profile, bool restart,
             free(copy);
         }
     }
+}
+
+static void
+cb_on_drop_files(const char *const *paths, size_t count,
+                 const char *remote_dir, void *userdata) {
+    struct sc_gui_app *app = userdata;
+    if (!app->session_serial) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        enqueue_transfer(app, paths[i], remote_dir);
+    }
+}
+
+static void
+cb_on_cancel_transfer(uint32_t id, void *userdata) {
+    struct sc_gui_app *app = userdata;
+    cancel_transfer(app, id);
 }
 
 static void
@@ -935,6 +1236,9 @@ drain_app_events(void) {
     while (sc_dequeue_event(SC_EVENT_GUI_TASK_DONE, &event)) {
         sc_gui_task_destroy(event.user.data1);
     }
+    while (sc_dequeue_event(SC_EVENT_GUI_TRANSFER, &event)) {
+        free(event.user.data1);
+    }
 }
 
 enum scrcpy_exit_code
@@ -995,6 +1299,8 @@ scrcpy_gui(struct scrcpy_options *options) {
         .on_disconnect = cb_on_disconnect,
         .on_profile_changed = cb_on_profile_changed,
         .on_prefs_changed = cb_on_prefs_changed,
+        .on_drop_files = cb_on_drop_files,
+        .on_cancel_transfer = cb_on_cancel_transfer,
     };
     struct sc_gui_params gui_params = {
         .window = app->window,
@@ -1019,10 +1325,27 @@ scrcpy_gui(struct scrcpy_options *options) {
     if (!sc_intr_init(&app->intr)) {
         goto end_cond;
     }
+    if (!sc_cond_init(&app->transfer_cond)) {
+        goto end_intr;
+    }
+    if (!sc_intr_init(&app->transfer_intr)) {
+        goto end_transfer_cond;
+    }
     if (!sc_thread_create(&app->worker, run_worker, "gui-worker",
                           app)) {
         LOGE("Could not start the device monitor");
-        goto end_intr;
+        goto end_transfer_intr;
+    }
+    if (!sc_thread_create(&app->transfer_thread, run_transfer_thread,
+                          "gui-transfer", app)) {
+        LOGE("Could not start the transfer thread");
+        sc_mutex_lock(&app->mutex);
+        app->stopped = true;
+        sc_cond_signal(&app->cond);
+        sc_mutex_unlock(&app->mutex);
+        sc_intr_interrupt(&app->intr);
+        sc_thread_join(&app->worker, NULL);
+        goto end_transfer_intr;
     }
 
 #if defined(__APPLE__) || defined(_WIN32)
@@ -1064,9 +1387,18 @@ scrcpy_gui(struct scrcpy_options *options) {
     sc_mutex_lock(&app->mutex);
     app->stopped = true;
     sc_cond_signal(&app->cond);
+    sc_cond_signal(&app->transfer_cond);
+    sc_intr_interrupt(&app->transfer_intr);
     sc_mutex_unlock(&app->mutex);
     sc_intr_interrupt(&app->intr);
     sc_thread_join(&app->worker, NULL);
+    sc_thread_join(&app->transfer_thread, NULL);
+
+    while (app->jobs) {
+        struct sc_gui_transfer_job *job = app->jobs;
+        app->jobs = job->next;
+        sc_gui_transfer_job_destroy(job);
+    }
 
     while (app->tasks) {
         struct sc_gui_task *task = app->tasks;
@@ -1075,6 +1407,10 @@ scrcpy_gui(struct scrcpy_options *options) {
     }
     drain_app_events();
 
+end_transfer_intr:
+    sc_intr_destroy(&app->transfer_intr);
+end_transfer_cond:
+    sc_cond_destroy(&app->transfer_cond);
 end_intr:
     sc_intr_destroy(&app->intr);
 end_cond:

@@ -39,6 +39,16 @@ struct sc_adb_device_selector {
 sc_pid
 sc_adb_execute(const char *const argv[], unsigned flags);
 
+/**
+ * Execute `adb <args...>` (args is NULL-terminated), and capture stdout and
+ * stderr into `out` (truncated, always NUL-terminated)
+ *
+ * Return true if the command succeeded (exit code 0).
+ */
+bool
+sc_adb_run_capture(struct sc_intr *intr, const char *const args[],
+                   char *out, size_t out_size);
+
 bool
 sc_adb_start_server(struct sc_intr *intr, unsigned flags);
 

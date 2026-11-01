@@ -253,6 +253,59 @@ sc_adb_execute(const char *const argv[], unsigned flags) {
 }
 
 bool
+sc_adb_run_capture(struct sc_intr *intr, const char *const args[],
+                   char *out, size_t out_size) {
+    assert(out && out_size);
+    out[0] = '\0';
+
+    size_t count = 0;
+    while (args[count]) {
+        ++count;
+    }
+
+    const char **argv = malloc((count + 2) * sizeof(*argv));
+    if (!argv) {
+        LOG_OOM();
+        return false;
+    }
+    argv[0] = sc_adb_get_executable();
+    for (size_t i = 0; i < count; ++i) {
+        argv[i + 1] = args[i];
+    }
+    argv[count + 1] = NULL;
+
+    sc_pid pid;
+    sc_pipe pout;
+    sc_pipe perr;
+    enum sc_process_result r =
+        sc_process_execute_p(argv, &pid, 0, NULL, &pout, &perr);
+    if (r != SC_PROCESS_SUCCESS) {
+        show_adb_err_msg(r, argv);
+        free(argv);
+        return false;
+    }
+
+    // The outputs of the commands used with this function are short, so
+    // reading stdout then stderr cannot block
+    size_t len = 0;
+    ssize_t n = sc_pipe_read_all_intr(intr, pid, pout, out, out_size - 1);
+    sc_pipe_close(pout);
+    if (n > 0) {
+        len = n;
+    }
+    n = sc_pipe_read_all_intr(intr, pid, perr, out + len, out_size - 1 - len);
+    sc_pipe_close(perr);
+    if (n > 0) {
+        len += n;
+    }
+    out[len] = '\0';
+
+    bool ok = process_check_success_intr(intr, pid, "adb", SC_ADB_NO_LOGERR);
+    free(argv);
+    return ok;
+}
+
+bool
 sc_adb_start_server(struct sc_intr *intr, unsigned flags) {
     const char *const argv[] = SC_ADB_COMMAND("start-server");
 

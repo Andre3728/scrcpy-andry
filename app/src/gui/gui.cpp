@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <new>
@@ -29,7 +30,7 @@ constexpr float TOOLBAR_BUTTON_SIZE = 36.f;
 constexpr float DEFAULT_AREA_WIDTH = 420.f;
 constexpr float DEFAULT_AREA_HEIGHT = 760.f;
 
-constexpr int TOOLBAR_BUTTONS = 9;
+constexpr int TOOLBAR_BUTTONS = 10;
 constexpr int TOOLBAR_SEPARATORS = 3;
 
 constexpr Uint64 TOAST_DURATION_MS = 4000;
@@ -150,6 +151,19 @@ struct Device {
     bool ready() const { return state == "device"; }
 };
 
+struct Transfer {
+    uint32_t id;
+    sc_gui_transfer_type type;
+    std::string name;
+    sc_gui_transfer_state state;
+    std::string detail;
+
+    bool active() const {
+        return state == SC_GUI_TRANSFER_PENDING
+            || state == SC_GUI_TRANSFER_RUNNING;
+    }
+};
+
 struct Toast {
     sc_gui_toast_level level;
     std::string text;
@@ -201,6 +215,17 @@ struct sc_gui {
     char connect_address[64] = "";
 
     std::vector<Toast> toasts;
+
+    // Drag & drop (SDL drop events)
+    bool drag_active = false;
+    ImVec2 drag_pos;
+    std::vector<std::string> drop_files;
+    // Destination folder under the cursor during a drag (file manager), or
+    // empty for the default behavior
+    std::string drop_target_dir;
+
+    std::vector<Transfer> transfers; // oldest first
+    bool open_transfers = false;
 
     bool mirror_focused = false;
     // A mouse button was pressed on the mirror: forward all mouse events to
@@ -1089,7 +1114,12 @@ void
 draw_page_apps(sc_gui *gui) {
     page_title(gui, "Apps");
     info_card(gui, "##apps", SC_ICON_PACKAGE, "Install apps",
-              "Drag .apk files onto the device screen to install them.");
+              "Drag .apk files onto the device screen to install them. "
+              "Progress and errors are shown in Transfers.");
+    ImGui::Dummy(ImVec2(0, gui->s(4)));
+    if (push_button(gui, SC_ICON_ARROW_DOWN_TO_LINE " Show transfers")) {
+        gui->open_transfers = true;
+    }
 }
 
 // A setting was edited
@@ -1369,6 +1399,217 @@ draw_placeholder(sc_gui *gui, float left, float width, float height) {
     ImGui::PopStyleVar();
 }
 
+const char *
+transfer_state_text(const Transfer &t) {
+    switch (t.state) {
+        case SC_GUI_TRANSFER_PENDING:
+            return "Waiting...";
+        case SC_GUI_TRANSFER_RUNNING:
+            return t.type == SC_GUI_TRANSFER_INSTALL ? "Installing..."
+                                                     : "Copying...";
+        case SC_GUI_TRANSFER_CANCELED:
+            return "Canceled";
+        default:
+            return nullptr; // use the detail
+    }
+}
+
+void
+draw_transfers_popup(sc_gui *gui, float anchor_x, float toolbar_y) {
+    float w = gui->s(340);
+    ImGui::SetNextWindowPos(ImVec2(anchor_x, toolbar_y - gui->s(6)),
+                            ImGuiCond_Always, ImVec2(0.5f, 1.f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0), ImVec2(w, gui->s(420)));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(gui->s(14), gui->s(12)));
+    if (!ImGui::BeginPopup("##transfers_popup")) {
+        ImGui::PopStyleVar();
+        return;
+    }
+
+    text_semibold(gui, "Transfers");
+    bool any_finished = false;
+    for (const Transfer &t : gui->transfers) {
+        any_finished |= !t.active();
+    }
+    if (any_finished) {
+        float bw = ImGui::CalcTextSize("Clear").x + gui->s(24);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - bw
+                        + ImGui::GetCursorPosX() - gui->s(4));
+        ImGui::SetCursorPosX(w - bw - gui->s(14));
+        if (push_button(gui, "Clear")) {
+            std::vector<Transfer> kept;
+            for (const Transfer &t : gui->transfers) {
+                if (t.active()) {
+                    kept.push_back(t);
+                }
+            }
+            gui->transfers.swap(kept);
+        }
+    }
+    ImGui::Separator();
+
+    if (gui->transfers.empty()) {
+        text_wrapped_colored(gui->pal.text_secondary,
+                             "No transfers. Drop APKs or files on the device "
+                             "screen to install or copy them.");
+    }
+
+    // Newest first
+    for (auto it = gui->transfers.rbegin(); it != gui->transfers.rend();
+            ++it) {
+        const Transfer &t = *it;
+        ImGui::PushID((int) t.id);
+
+        const char *icon = t.type == SC_GUI_TRANSFER_INSTALL
+                         ? SC_ICON_PACKAGE : SC_ICON_FOLDER;
+        ImU32 color = gui->pal.accent;
+        if (t.state == SC_GUI_TRANSFER_DONE) {
+            color = gui->pal.success;
+        } else if (t.state == SC_GUI_TRANSFER_FAILED) {
+            color = gui->pal.error;
+        } else if (t.state == SC_GUI_TRANSFER_CANCELED) {
+            color = gui->pal.text_secondary;
+        }
+        icon_text(color, icon, 18.f);
+        ImGui::SameLine();
+
+        ImGui::BeginGroup();
+        float text_w = w - gui->s(14 * 2 + 30 + 30);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + text_w);
+        text_semibold(gui, t.name.c_str());
+        const char *state = transfer_state_text(t);
+        const char *detail = state ? state : t.detail.c_str();
+        ImU32 detail_color = t.state == SC_GUI_TRANSFER_FAILED
+                           ? gui->pal.error : gui->pal.text_secondary;
+        ImGui::PushStyleColor(ImGuiCol_Text, detail_color);
+        ImGui::TextUnformatted(detail);
+        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+        ImGui::EndGroup();
+
+        if (t.active()) {
+            ImGui::SameLine(w - gui->s(14 + 26));
+            if (t.state == SC_GUI_TRANSFER_RUNNING) {
+                spinner(gui, 8, gui->pal.text_secondary);
+                ImGui::SameLine(w - gui->s(14 + 26));
+            }
+            ImGui::PushStyleColor(ImGuiCol_Button, 0);
+            if (ImGui::Button(SC_ICON_X, ImVec2(gui->s(24), gui->s(24)))) {
+                uint32_t id = t.id;
+                defer(gui, [gui, id] {
+                    if (gui->cbs && gui->cbs->on_cancel_transfer) {
+                        gui->cbs->on_cancel_transfer(id, gui->cbs_userdata);
+                    }
+                });
+            }
+            ImGui::PopStyleColor();
+            ImGui::SetItemTooltip("Cancel");
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::EndPopup();
+    ImGui::PopStyleVar();
+}
+
+// Feedback while files are dragged over the window
+void
+draw_drop_overlay(sc_gui *gui, float left, float width, float height) {
+    if (!gui->drag_active) {
+        return;
+    }
+
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    float m = gui->s(12);
+    ImVec2 p0(left + m, m);
+    ImVec2 p1(left + width - m, height - gui->s(TOOLBAR_HEIGHT));
+    if (p1.x <= p0.x || p1.y <= p0.y) {
+        return;
+    }
+
+    bool can_drop = is_mirroring(gui);
+    ImU32 color = can_drop ? gui->pal.accent : gui->pal.text_secondary;
+    dl->AddRectFilled(p0, p1, (color & 0x00FFFFFF) | 0x33000000, gui->s(16));
+    dl->AddRect(p0, p1, color, gui->s(16), 0, gui->s(2));
+
+    const char *title;
+    const char *body;
+    if (!can_drop) {
+        title = "No device";
+        body = "Mirror a device to drop files";
+    } else if (!gui->drop_target_dir.empty()) {
+        title = "Copy to folder";
+        body = gui->drop_target_dir.c_str();
+    } else {
+        title = "Drop to install or copy";
+        body = "APKs are installed, other files go to /sdcard/Download";
+    }
+
+    // Opaque card in the center, readable over the video
+    ImGui::PushFont(gui->font_semibold, 16.f);
+    ImVec2 title_size = ImGui::CalcTextSize(title);
+    ImGui::PopFont();
+    ImVec2 body_size = ImGui::CalcTextSize(body);
+    ImGui::PushFont(nullptr, 40.f);
+    ImVec2 icon_size = ImGui::CalcTextSize(SC_ICON_UPLOAD);
+    ImGui::PopFont();
+
+    float pad = gui->s(18);
+    float card_w = std::fmax(title_size.x, body_size.x) + 2 * pad;
+    float card_h = icon_size.y + title_size.y + body_size.y + gui->s(8)
+                 + 2 * pad;
+    ImVec2 center((p0.x + p1.x) / 2, (p0.y + p1.y) / 2);
+    ImVec2 c0(center.x - card_w / 2, center.y - card_h / 2);
+    ImVec2 c1(center.x + card_w / 2, center.y + card_h / 2);
+    dl->AddRectFilled(c0, c1, gui->pal.toolbar_bg, gui->s(14));
+    dl->AddRect(c0, c1, gui->pal.toolbar_border, gui->s(14), 0, gui->s(1));
+
+    float y = c0.y + pad;
+    ImGui::PushFont(nullptr, 40.f);
+    dl->AddText(ImVec2(center.x - icon_size.x / 2, y), color, SC_ICON_UPLOAD);
+    ImGui::PopFont();
+    y += icon_size.y + gui->s(4);
+    ImGui::PushFont(gui->font_semibold, 16.f);
+    dl->AddText(ImVec2(center.x - title_size.x / 2, y), gui->pal.text, title);
+    ImGui::PopFont();
+    y += title_size.y + gui->s(4);
+    dl->AddText(ImVec2(center.x - body_size.x / 2, y),
+                gui->pal.text_secondary, body);
+}
+
+void
+finish_drop(sc_gui *gui) {
+    std::vector<std::string> files;
+    files.swap(gui->drop_files);
+    std::string remote_dir = gui->drop_target_dir;
+    gui->drop_target_dir.clear();
+    if (files.empty()) {
+        return;
+    }
+
+    if (!is_mirroring(gui)) {
+        add_toast(gui, SC_GUI_TOAST_INFO,
+                  "Mirror a device to install apps or copy files.");
+        return;
+    }
+
+    gui->open_transfers = true;
+    defer(gui, [gui, files, remote_dir] {
+        if (!gui->cbs || !gui->cbs->on_drop_files) {
+            return;
+        }
+        std::vector<const char *> paths;
+        for (const std::string &f : files) {
+            paths.push_back(f.c_str());
+        }
+        gui->cbs->on_drop_files(paths.data(), paths.size(),
+                                remote_dir.empty() ? nullptr
+                                                   : remote_dir.c_str(),
+                                gui->cbs_userdata);
+    });
+}
+
 ImVec2
 toolbar_pill_size(sc_gui *gui) {
     const float button = gui->s(TOOLBAR_BUTTON_SIZE);
@@ -1455,11 +1696,42 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
         run_action(gui, SC_GUI_ACTION_ROTATE_DEVICE);
     }
     ImGui::SameLine();
+    ImGui::EndDisabled();
+
+    // Transfers (enabled even without a session, to see the history)
+    int active = 0;
+    for (const Transfer &t : gui->transfers) {
+        active += t.active();
+    }
+    ImVec2 transfers_pos = ImGui::GetCursorScreenPos();
+    if (toolbar_button(gui, "##transfers", SC_ICON_ARROW_DOWN_TO_LINE,
+                       "Transfers", active > 0) || gui->open_transfers) {
+        ImGui::OpenPopup("##transfers_popup");
+        gui->open_transfers = false;
+    }
+    if (active) {
+        char count[8];
+        snprintf(count, sizeof(count), "%d", active);
+        ImDrawList *bdl = ImGui::GetWindowDrawList();
+        float r = gui->s(7);
+        ImVec2 c = transfers_pos + ImVec2(button - r + gui->s(1), r);
+        bdl->AddCircleFilled(c, r, gui->pal.accent);
+        ImGui::PushFont(gui->font_semibold, 10.f);
+        ImVec2 ts = ImGui::CalcTextSize(count);
+        bdl->AddText(ImVec2(c.x - ts.x / 2, c.y - ts.y / 2), rgba(0xFFFFFF),
+                     count);
+        ImGui::PopFont();
+    }
+    ImGui::SameLine();
+
+    ImGui::BeginDisabled(!is_mirroring(gui) || !gui->control);
     ImVec2 more_pos = ImGui::GetCursorScreenPos();
     if (toolbar_button(gui, "##more", SC_ICON_ELLIPSIS, "More")) {
         ImGui::OpenPopup("##more_menu");
     }
     ImGui::EndDisabled();
+
+    draw_transfers_popup(gui, transfers_pos.x + button / 2, y);
 
     ImGui::SetNextWindowPos(ImVec2(more_pos.x + button / 2, y - gui->s(6)),
                             ImGuiCond_Appearing, ImVec2(0.5f, 1.f));
@@ -1601,7 +1873,9 @@ schedule_timer(sc_gui *gui) {
                || !gui->toasts.empty()
                || gui->session == SC_GUI_SESSION_CONNECTING
                || gui->task_busy
-               || !gui->devices_known;
+               || !gui->devices_known
+               || std::any_of(gui->transfers.begin(), gui->transfers.end(),
+                              [](const Transfer &t) { return t.active(); });
     if (!needed || SDL_GetAtomicInt(&gui->timer_pending)) {
         return;
     }
@@ -1811,18 +2085,41 @@ sc_gui_handle_event(struct sc_gui *gui, const SDL_Event *event,
                 return true;
             }
             return false;
+        // The GUI handles drag & drop itself (instead of the scrcpy file
+        // pusher), to show feedback and progress
         case SDL_EVENT_DROP_BEGIN:
+            gui->drag_active = true;
+            gui->drop_files.clear();
+            request_redraw(gui);
+            return true;
         case SDL_EVENT_DROP_POSITION:
-        case SDL_EVENT_DROP_COMPLETE:
+            gui->drag_active = true;
+            gui->drag_pos = ImVec2(event->drop.x, event->drop.y);
+            request_redraw(gui);
+            return true;
         case SDL_EVENT_DROP_FILE:
+            if (event->drop.data) {
+                gui->drop_files.push_back(event->drop.data);
+            }
+            return true;
         case SDL_EVENT_DROP_TEXT:
-            // Files can only be dropped while mirroring
-            return !mirror_rect;
+            return true;
+        case SDL_EVENT_DROP_COMPLETE:
+            gui->drag_active = false;
+            finish_drop(gui);
+            request_redraw(gui);
+            return true;
         case SDL_EVENT_WINDOW_FOCUS_LOST:
             gui->mirror_drag = false;
             request_redraw(gui);
             return false;
         case SDL_EVENT_WINDOW_MOUSE_LEAVE:
+            if (gui->drag_active && gui->drop_files.empty()) {
+                // The drag left the window without dropping
+                gui->drag_active = false;
+            }
+            request_redraw(gui);
+            return false;
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
         case SDL_EVENT_WINDOW_EXPOSED:
         case SDL_EVENT_WINDOW_RESIZED:
@@ -1865,6 +2162,8 @@ sc_gui_render(struct sc_gui *gui, const SDL_FRect *mirror_rect) {
         }
         draw_toolbar(gui, insets.left, display.x - insets.left, display.y);
         draw_focus_ring(gui, mirror_rect);
+        draw_drop_overlay(gui, insets.left, display.x - insets.left,
+                          display.y);
     }
     draw_toasts(gui, display.x);
 
@@ -1938,6 +2237,35 @@ sc_gui_set_prefs(struct sc_gui *gui, const struct sc_gui_prefs *prefs) {
     update_theme(gui);
     if (sidebar_changed) {
         notify_insets_changed(gui);
+    }
+    request_redraw(gui);
+}
+
+void
+sc_gui_update_transfer(struct sc_gui *gui, uint32_t id,
+                       enum sc_gui_transfer_type type, const char *name,
+                       enum sc_gui_transfer_state state, const char *detail) {
+    for (Transfer &t : gui->transfers) {
+        if (t.id == id) {
+            t.state = state;
+            if (detail) {
+                t.detail = detail;
+            }
+            request_redraw(gui);
+            return;
+        }
+    }
+    gui->transfers.push_back({id, type, name ? name : "", state,
+                              detail ? detail : ""});
+    if (gui->transfers.size() > 100) {
+        // Forget the oldest finished transfer
+        for (auto it = gui->transfers.begin(); it != gui->transfers.end();
+                ++it) {
+            if (!it->active()) {
+                gui->transfers.erase(it);
+                break;
+            }
+        }
     }
     request_redraw(gui);
 }
