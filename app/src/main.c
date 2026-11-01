@@ -12,6 +12,9 @@
 #include "options.h"
 #include "scrcpy.h"
 #include "gui_app.h"
+#ifdef SC_BUNDLE
+# include "sys/win/bundle.h"
+#endif
 #ifdef HAVE_USB
 # include "usb/scrcpy_otg.h"
 #endif
@@ -25,9 +28,38 @@
 #include "util/str.h"
 #endif
 
+#ifdef _WIN32
+// Reopen a standard stream on the console, unless it is already redirected
+// (to a file or a pipe)
+static void
+reopen_on_console(DWORD std_handle, const char *path, const char *mode,
+                  FILE *stream) {
+    HANDLE h = GetStdHandle(std_handle);
+    if (h && h != INVALID_HANDLE_VALUE) {
+        DWORD type = GetFileType(h);
+        if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE) {
+            return; // redirected, keep it
+        }
+    }
+    if (!freopen(path, mode, stream)) {
+        // ignore, the stream is just unavailable
+    }
+}
+#endif
+
 static int
 main_scrcpy(int argc, char *argv[]) {
 #ifdef _WIN32
+    // scrcpy-gui is a GUI application (no console window). When run with
+    // arguments from a terminal, print to that terminal (except the streams
+    // redirected to a file or a pipe).
+    if (argc > 1 && !GetConsoleWindow()
+            && AttachConsole(ATTACH_PARENT_PROCESS)) {
+        reopen_on_console(STD_OUTPUT_HANDLE, "CONOUT$", "w", stdout);
+        reopen_on_console(STD_ERROR_HANDLE, "CONOUT$", "w", stderr);
+        reopen_on_console(STD_INPUT_HANDLE, "CONIN$", "r", stdin);
+    }
+
     // disable buffering, we want logs immediately
     // even line buffering (setvbuf() with mode _IOLBF) is not sufficient
     setbuf(stdout, NULL);
@@ -61,6 +93,19 @@ main_scrcpy(int argc, char *argv[]) {
         // scrcpy-gui: launching without arguments opens the GUI
         args.opts.gui = true;
     }
+
+#ifdef SC_BUNDLE
+    // Single-file build: extract adb, the server and the icons
+    if (!sc_bundle_init()) {
+        LOGW("Could not extract the bundled files");
+    } else if (!args.opts.gui && !_wgetenv(L"ADB")) {
+        // In GUI mode, the app decides (the adb path setting has priority)
+        const wchar_t *adb = _wgetenv(L"SCRCPY_GUI_BUNDLED_ADB");
+        if (adb) {
+            _wputenv_s(L"ADB", adb);
+        }
+    }
+#endif
 
 #ifdef _WIN32
     if (args.opts.gui && args.pause_on_exit == SC_PAUSE_ON_EXIT_IF_ERROR) {

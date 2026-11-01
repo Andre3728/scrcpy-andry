@@ -1,6 +1,7 @@
 project('scrcpy', 'c',
         version: '5.0.1',
-        meson_version: '>= 0.54', # scrcpy-gui: add_languages(native: false)
+        meson_version: '>= 0.56', # scrcpy-gui: add_languages(native: false),
+                                  # win_subsystem
         default_options: [
             'c_std=c11',
             'warning_level=2',

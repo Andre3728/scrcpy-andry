@@ -7,8 +7,8 @@ under the mirror.
 
 ## Launch
 
-Double-click `scrcpy-gui.exe` (or run it without arguments). The window stays
-open between mirroring sessions:
+Double-click `scrcpy-gui.exe` (or run it without arguments). No console window
+is opened. The window stays open between mirroring sessions:
 
  - if a single device is ready, it is mirrored automatically;
  - with several devices, click **Mirror** next to one in **Devices**;
@@ -16,7 +16,9 @@ open between mirroring sessions:
    it comes back.
 
 With command line arguments, `scrcpy-gui` behaves exactly like `scrcpy` (no
-panel). Add `--gui` to get the panel and use the arguments as defaults:
+panel). Run from a terminal, it prints its output to that terminal (the prompt
+may come back before the output, because it is a GUI application). Add
+`--gui` to get the panel and use the arguments as defaults:
 
 ```bash
 scrcpy-gui --gui --max-size=1024
@@ -33,6 +35,14 @@ scrcpy-gui --gui -s 0123456789abcdef   # mirror this device first
    Wireless debugging > Pair device with pairing code_, then enter the IP
    address, port and code.
  - **Connect**: connect to `IP:port` (shown under _Wireless debugging_).
+
+
+## Connection log
+
+The bottom of the left panel shows the last log message (connection, server,
+errors). Click it to expand the full log (with the messages of the scrcpy
+server running on the device), copy it, or clear it. A red dot indicates new
+errors while it is collapsed.
 
 
 ## Toolbar
@@ -86,11 +96,19 @@ version conflicts), set it in **Settings > Advanced**, or set the `ADB`
 environment variable.
 
 
+## Single executable
+
+`scrcpy-gui-<version>.exe` contains everything (SDL, FFmpeg, adb, the
+scrcpy server). On first launch, adb, the server and the icons are extracted to
+`%LOCALAPPDATA%\scrcpy-gui\runtime\<hash>\` (a few MB, reused by the next
+launches, and replaced when the executable is updated).
+
+
 ## Build
 
-See [gui-plan.md](gui-plan.md#build-and-test). In short, from the MSYS2 UCRT64
-shell:
+See [gui-plan.md](gui-plan.md#build-and-test). From the MSYS2 UCRT64 shell:
 
 ```bash
-release/build_gui_windows.sh
+release/build_gui_windows_onefile.sh  # single executable (dist/*.exe)
+release/build_gui_windows.sh          # portable folder + zip (MSYS2 DLLs)
 ```

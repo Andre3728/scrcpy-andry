@@ -287,6 +287,18 @@ sc_gui_set_recording(struct sc_gui *gui, bool recording);
 void
 sc_gui_flash(struct sc_gui *gui);
 
+enum sc_gui_log_level {
+    SC_GUI_LOG_INFO,
+    SC_GUI_LOG_WARN,
+    SC_GUI_LOG_ERROR,
+};
+
+// Append a line to the connection log (thread-safe, may be called from any
+// thread)
+void
+sc_gui_append_log(struct sc_gui *gui, enum sc_gui_log_level level,
+                  const char *message);
+
 // Indicate that a background device task (Wi-Fi switch, pairing...) is running
 void
 sc_gui_set_task_busy(struct sc_gui *gui, bool busy);

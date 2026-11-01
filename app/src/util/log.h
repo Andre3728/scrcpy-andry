@@ -38,4 +38,12 @@ sc_log_windows_error(const char *prefix, int error);
 void
 sc_log_configure(void);
 
+// scrcpy-gui: receive a copy of every log message (from any thread). Set it
+// before starting threads, and clear it (NULL) after joining them.
+typedef void (*sc_log_listener_fn)(void *userdata, SDL_LogPriority priority,
+                                   const char *message);
+
+void
+sc_log_set_listener(sc_log_listener_fn fn, void *userdata);
+
 #endif

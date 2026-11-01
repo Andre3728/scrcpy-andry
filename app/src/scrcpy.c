@@ -510,6 +510,7 @@ scrcpy_run(struct scrcpy_options *options, struct scrcpy_gui_host *host) {
         .ignore_video_encoder_constraints =
             options->ignore_video_encoder_constraints,
         .list = options->list,
+        .capture_output = host != NULL,
     };
 
     static const struct sc_server_callbacks cbs = {

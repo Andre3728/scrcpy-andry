@@ -47,5 +47,9 @@
 #define SC_ICON_FOLDER_PLUS        ""
 #define SC_ICON_MAP_PIN            ""
 #define SC_ICON_TRASH              ""
+#define SC_ICON_SCROLL_TEXT        ""
+#define SC_ICON_CHEVRON_UP         ""
+#define SC_ICON_CHEVRON_DOWN       ""
+#define SC_ICON_COPY               ""
 
 #endif

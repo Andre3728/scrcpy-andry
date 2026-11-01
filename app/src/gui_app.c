@@ -33,6 +33,7 @@
 #include "screen.h"
 #include "sdl_hints.h"
 #include "shortcut_mod.h"
+#include "util/env.h"
 #include "util/intr.h"
 #include "util/log.h"
 #include "util/sdl.h"
@@ -957,6 +958,21 @@ update_titlebar(struct sc_gui_app *app) {
 #else
     (void) app;
 #endif
+}
+
+// Copy the log messages to the connection log of the GUI (any thread)
+static void
+on_log_message(void *userdata, SDL_LogPriority priority, const char *message) {
+    struct sc_gui *gui = userdata;
+    if (priority < SDL_LOG_PRIORITY_INFO) {
+        return; // debug and verbose messages would flood the panel
+    }
+    enum sc_gui_log_level level = priority >= SDL_LOG_PRIORITY_ERROR
+                                ? SC_GUI_LOG_ERROR
+                                : priority == SDL_LOG_PRIORITY_WARN
+                                ? SC_GUI_LOG_WARN
+                                : SC_GUI_LOG_INFO;
+    sc_gui_append_log(gui, level, message);
 }
 
 // Show a fatal error to the user (the console may not be visible)
@@ -1953,13 +1969,28 @@ scrcpy_gui(struct scrcpy_options *options) {
     sc_gui_config_init(&app->config);
     sc_gui_config_load(&app->config);
 
-    // adb path from the settings (the ADB environment variable wins)
-    if (*app->config.prefs.adb_path && !SDL_getenv("ADB")) {
+    // adb: the ADB environment variable, else the adb path from the
+    // settings, else the adb bundled in the executable (single-file build),
+    // else "adb" from the PATH
+    char *env_adb = sc_get_env("ADB");
+    if (env_adb) {
+        free(env_adb);
+    } else if (*app->config.prefs.adb_path) {
 #ifdef _WIN32
         _putenv_s("ADB", app->config.prefs.adb_path);
 #else
         setenv("ADB", app->config.prefs.adb_path, 0);
 #endif
+    } else {
+        char *bundled = sc_get_env("SCRCPY_GUI_BUNDLED_ADB");
+        if (bundled) {
+#ifdef _WIN32
+            _putenv_s("ADB", bundled);
+#else
+            setenv("ADB", bundled, 0);
+#endif
+            free(bundled);
+        }
     }
 
     if (!sc_adb_init()) {
@@ -2006,6 +2037,9 @@ scrcpy_gui(struct scrcpy_options *options) {
         show_fatal_error("Could not initialize the GUI.");
         goto end_window;
     }
+
+    // From now on, the log messages are also shown in the GUI
+    sc_log_set_listener(on_log_message, app->gui);
 
     if (!sc_mutex_init(&app->mutex)) {
         goto end_gui;
@@ -2110,6 +2144,8 @@ end_cond:
 end_mutex:
     sc_mutex_destroy(&app->mutex);
 end_gui:
+    // All the threads are joined
+    sc_log_set_listener(NULL, NULL);
     sc_gui_destroy(app->gui);
 end_window:
     SDL_DestroyRenderer(app->renderer);

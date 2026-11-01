@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <algorithm>
+#include <deque>
 #include <cstring>
 #include <functional>
 #include <new>
@@ -184,6 +185,16 @@ struct Transfer {
     }
 };
 
+struct LogLine {
+    std::string time; // "HH:MM:SS"
+    sc_gui_log_level level;
+    std::string text;
+};
+
+constexpr size_t LOG_MAX_LINES = 1000;
+constexpr float LOG_HEADER_HEIGHT = 34.f;
+constexpr float LOG_EXPANDED_HEIGHT = 220.f;
+
 struct Toast {
     sc_gui_toast_level level;
     std::string text;
@@ -281,6 +292,14 @@ struct sc_gui {
     // Low-rate redraw timer (tooltip delays, animations, toast expiration)
     SDL_TimerID timer = 0;
     SDL_AtomicInt timer_pending;
+
+    // Connection log (written from any thread, protected by log_mutex)
+    SDL_Mutex *log_mutex = nullptr;
+    std::deque<LogLine> logs;
+    unsigned log_errors_unseen = 0; // errors while collapsed
+    SDL_AtomicInt log_redraw_pending;
+    bool log_expanded = false;
+    bool log_scroll_to_bottom = true;
 
     // Callbacks requested during rendering, dispatched outside of it
     std::vector<std::function<void()>> pending;
@@ -882,6 +901,171 @@ status_dot(sc_gui *gui, ImU32 color) {
                         r, color);
     ImGui::Dummy(ImVec2(r * 2 + gui->s(2), ImGui::GetFontSize()));
     ImGui::SameLine();
+}
+
+float
+log_panel_height(sc_gui *gui) {
+    return gui->s(gui->log_expanded ? LOG_EXPANDED_HEIGHT
+                                    : LOG_HEADER_HEIGHT);
+}
+
+ImU32
+log_color(sc_gui *gui, sc_gui_log_level level) {
+    switch (level) {
+        case SC_GUI_LOG_ERROR:
+            return gui->pal.error;
+        case SC_GUI_LOG_WARN:
+            return gui->pal.warning;
+        default:
+            return gui->pal.text_secondary;
+    }
+}
+
+// Connection log, at the bottom of the left panel
+void
+draw_log_panel(sc_gui *gui, float width, float display_height) {
+    float h = log_panel_height(gui);
+    float y = display_height - h;
+
+    ImGui::SetNextWindowPos(ImVec2(0, y));
+    ImGui::SetNextWindowSize(ImVec2(width, h));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, gui->pal.sidebar_bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(gui->s(12), gui->s(6)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
+                        ImVec2(gui->s(6), gui->s(4)));
+    ImGui::Begin("##log", nullptr, PANEL_FLAGS);
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddLine(ImVec2(0, y), ImVec2(width, y), gui->pal.separator,
+                gui->s(1));
+
+    // Copy the lines (they may be appended by other threads)
+    std::deque<LogLine> lines;
+    SDL_LockMutex(gui->log_mutex);
+    if (gui->log_expanded) {
+        lines = gui->logs;
+        gui->log_errors_unseen = 0;
+    } else if (!gui->logs.empty()) {
+        lines.push_back(gui->logs.back());
+    }
+    unsigned errors = gui->log_errors_unseen;
+    SDL_UnlockMutex(gui->log_mutex);
+
+    // Header: click to expand/collapse
+    ImVec2 header_pos = ImGui::GetCursorScreenPos();
+    float header_w = ImGui::GetContentRegionAvail().x;
+    float header_h = gui->s(LOG_HEADER_HEIGHT) - gui->s(12);
+    float buttons_w = gui->log_expanded ? gui->s(64) : 0;
+    if (ImGui::InvisibleButton("##log_header",
+                               ImVec2(header_w - buttons_w, header_h))) {
+        gui->log_expanded = !gui->log_expanded;
+        gui->log_scroll_to_bottom = true;
+    }
+    bool header_hovered = ImGui::IsItemHovered();
+    ImGui::SetCursorScreenPos(header_pos);
+
+    float fs = ImGui::GetFontSize();
+    float ty = header_pos.y + (header_h - fs) / 2;
+    float x = header_pos.x;
+    dl->AddText(ImVec2(x, ty - gui->s(1)), gui->pal.accent,
+                SC_ICON_SCROLL_TEXT);
+    x += gui->s(22);
+    ImGui::PushFont(gui->font_semibold, 0);
+    const char *title = "Connection log";
+    dl->AddText(ImVec2(x, ty), gui->pal.text, title);
+    x += ImGui::CalcTextSize(title).x + gui->s(8);
+    ImGui::PopFont();
+
+    if (errors) {
+        // Unseen errors while collapsed
+        float r = gui->s(4);
+        dl->AddCircleFilled(ImVec2(x + r, ty + fs / 2), r, gui->pal.error);
+        x += 2 * r + gui->s(8);
+    }
+
+    float right = header_pos.x + header_w - buttons_w;
+    if (!gui->log_expanded && !lines.empty()) {
+        // Last line, as a live status
+        const LogLine &last = lines.back();
+        ImVec4 clip(x, header_pos.y, right - gui->s(20),
+                    header_pos.y + header_h);
+        ImGui::PushFont(nullptr, 12.f);
+        float lfs = ImGui::GetFontSize();
+        dl->AddText(nullptr, 0,
+                    ImVec2(x, header_pos.y + (header_h - lfs) / 2),
+                    log_color(gui, last.level), last.text.c_str(), nullptr,
+                    0, &clip);
+        ImGui::PopFont();
+    }
+    dl->AddText(ImVec2(right - gui->s(16), ty - gui->s(1)),
+                header_hovered ? gui->pal.text : gui->pal.text_secondary,
+                gui->log_expanded ? SC_ICON_CHEVRON_DOWN : SC_ICON_CHEVRON_UP);
+
+    if (gui->log_expanded) {
+        ImGui::SetCursorScreenPos(ImVec2(right + gui->s(4), header_pos.y));
+        ImGui::PushStyleColor(ImGuiCol_Button, 0);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(gui->s(4), gui->s(2)));
+        if (ImGui::Button(SC_ICON_COPY)) {
+            std::string all;
+            for (const LogLine &l : lines) {
+                all += l.time + "  " + l.text + "\n";
+            }
+            ImGui::SetClipboardText(all.c_str());
+            add_toast(gui, SC_GUI_TOAST_INFO, "Log copied to the clipboard.");
+        }
+        ImGui::SetItemTooltip("Copy the log");
+        ImGui::SameLine(0, gui->s(2));
+        if (ImGui::Button(SC_ICON_TRASH)) {
+            SDL_LockMutex(gui->log_mutex);
+            gui->logs.clear();
+            SDL_UnlockMutex(gui->log_mutex);
+            lines.clear();
+        }
+        ImGui::SetItemTooltip("Clear");
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+
+        // Lines
+        ImGui::SetCursorScreenPos(ImVec2(header_pos.x,
+                                         header_pos.y + header_h
+                                             + gui->s(4)));
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, gui->pal.pane_bg);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                            ImVec2(gui->s(8), gui->s(6)));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, gui->s(2)));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, gui->s(8));
+        ImGui::BeginChild("##log_lines", ImVec2(0, 0),
+                          ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        bool at_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1;
+        ImGui::PushFont(nullptr, 12.f);
+        if (lines.empty()) {
+            text_colored(gui->pal.text_secondary, "No messages yet.");
+        }
+        for (const LogLine &l : lines) {
+            text_colored(gui->pal.text_secondary & 0x99FFFFFF,
+                         l.time.c_str());
+            ImGui::SameLine(0, gui->s(8));
+            text_colored(l.level == SC_GUI_LOG_INFO ? gui->pal.text
+                                                    : log_color(gui, l.level),
+                         l.text.c_str());
+        }
+        ImGui::PopFont();
+        // Follow the new lines, unless the user scrolled up
+        if (gui->log_scroll_to_bottom || at_bottom) {
+            ImGui::SetScrollHereY(1.0f);
+            gui->log_scroll_to_bottom = false;
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar(3);
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
 }
 
 void
@@ -2740,6 +2924,12 @@ sc_gui_create(const struct sc_gui_params *params) {
     gui->cbs = params->cbs;
     gui->cbs_userdata = params->cbs_userdata;
     SDL_SetAtomicInt(&gui->timer_pending, 0);
+    SDL_SetAtomicInt(&gui->log_redraw_pending, 0);
+    gui->log_mutex = SDL_CreateMutex();
+    if (!gui->log_mutex) {
+        delete gui;
+        return nullptr;
+    }
 
     IMGUI_CHECKVERSION();
     gui->ctx = ImGui::CreateContext();
@@ -2790,6 +2980,7 @@ sc_gui_destroy(struct sc_gui *gui) {
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext(gui->ctx);
+    SDL_DestroyMutex(gui->log_mutex);
     delete gui;
 }
 
@@ -2992,6 +3183,9 @@ void
 sc_gui_render(struct sc_gui *gui, const SDL_FRect *mirror_rect) {
     ImGui::SetCurrentContext(gui->ctx);
 
+    // New log lines appended after this point trigger another frame
+    SDL_SetAtomicInt(&gui->log_redraw_pending, 0);
+
     ImGui_ImplSDLRenderer3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -3001,8 +3195,10 @@ sc_gui_render(struct sc_gui *gui, const SDL_FRect *mirror_rect) {
     if (!is_fullscreen(gui)) {
         sc_gui_insets insets = sc_gui_get_insets(gui);
         if (gui->sidebar_visible) {
-            draw_nav(gui, display.y);
-            draw_pane(gui, display.y);
+            float log_h = log_panel_height(gui);
+            draw_nav(gui, display.y - log_h);
+            draw_pane(gui, display.y - log_h);
+            draw_log_panel(gui, insets.left, display.y);
         }
         if (!mirror_rect) {
             draw_placeholder(gui, insets.left, display.x - insets.left,
@@ -3155,6 +3351,42 @@ sc_gui_set_listing(struct sc_gui *gui, const char *path,
     gui->files_selected.swap(selected);
     files_sort(gui);
     request_redraw(gui);
+}
+
+void
+sc_gui_append_log(struct sc_gui *gui, enum sc_gui_log_level level,
+                  const char *message) {
+    char time[16] = "";
+    SDL_Time now;
+    SDL_DateTime dt;
+    if (SDL_GetCurrentTime(&now) && SDL_TimeToDateTime(now, &dt, true)) {
+        snprintf(time, sizeof(time), "%02d:%02d:%02d", dt.hour, dt.minute,
+                 dt.second);
+    }
+
+    // Keep the first line of the message only (e.g. Windows errors end with
+    // a newline)
+    std::string text = message;
+    size_t eol = text.find_first_of("\r\n");
+    if (eol != std::string::npos) {
+        text.resize(eol);
+    }
+
+    SDL_LockMutex(gui->log_mutex);
+    gui->logs.push_back({time, level, text});
+    if (gui->logs.size() > LOG_MAX_LINES) {
+        gui->logs.pop_front();
+    }
+    if (level == SC_GUI_LOG_ERROR && !gui->log_expanded) {
+        ++gui->log_errors_unseen;
+    }
+    SDL_UnlockMutex(gui->log_mutex);
+
+    // Redraw once (not for every line of a burst)
+    if (!SDL_GetAtomicInt(&gui->log_redraw_pending)) {
+        SDL_SetAtomicInt(&gui->log_redraw_pending, 1);
+        push_redraw_event(gui);
+    }
 }
 
 void

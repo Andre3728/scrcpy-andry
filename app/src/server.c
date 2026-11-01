@@ -205,6 +205,124 @@ validate_string(const char *s) {
     return true;
 }
 
+// scrcpy-gui: log a line printed by the server, such as
+// "[server] INFO: Device: ...", at its own level
+static void
+log_server_line(char *line, SDL_LogPriority *last) {
+    size_t len = strlen(line);
+    while (len && (line[len - 1] == '\r' || line[len - 1] == ' ')) {
+        line[--len] = '\0';
+    }
+    if (!len) {
+        return;
+    }
+
+    static const struct {
+        const char *tag;
+        SDL_LogPriority priority;
+    } levels[] = {
+        {"VERBOSE: ", SDL_LOG_PRIORITY_VERBOSE},
+        {"DEBUG: ", SDL_LOG_PRIORITY_DEBUG},
+        {"INFO: ", SDL_LOG_PRIORITY_INFO},
+        {"WARN: ", SDL_LOG_PRIORITY_WARN},
+        {"ERROR: ", SDL_LOG_PRIORITY_ERROR},
+    };
+
+    const char *prefix = "[server] ";
+    size_t prefix_len = strlen(prefix);
+    if (!strncmp(line, prefix, prefix_len)) {
+        const char *rest = line + prefix_len;
+        for (size_t i = 0; i < sizeof(levels) / sizeof(*levels); ++i) {
+            size_t tag_len = strlen(levels[i].tag);
+            if (!strncmp(rest, levels[i].tag, tag_len)) {
+                *last = levels[i].priority;
+                // "[server] Device: ..." (the level is not repeated)
+                memmove(line + prefix_len, rest + tag_len,
+                        strlen(rest + tag_len) + 1);
+                break;
+            }
+        }
+    }
+    // Other lines (e.g. stack traces) keep the level of the previous line
+
+    SDL_LogMessage(SDL_LOG_CATEGORY_APPLICATION, *last, "%s", line);
+}
+
+static int
+run_server_output(void *data) {
+    struct sc_server *server = data;
+
+    char buf[4096];
+    size_t len = 0;
+    SDL_LogPriority last = SDL_LOG_PRIORITY_INFO;
+    for (;;) {
+        ssize_t r = sc_pipe_read(server->output_pipe, buf + len,
+                                 sizeof(buf) - 1 - len);
+        if (r <= 0) {
+            break;
+        }
+        len += r;
+
+        size_t start = 0;
+        for (size_t i = 0; i < len; ++i) {
+            if (buf[i] == '\n') {
+                buf[i] = '\0';
+                log_server_line(buf + start, &last);
+                start = i + 1;
+            }
+        }
+        memmove(buf, buf + start, len - start);
+        len -= start;
+
+        if (len == sizeof(buf) - 1) {
+            // Line too long, log what we have
+            buf[len] = '\0';
+            log_server_line(buf, &last);
+            len = 0;
+        }
+    }
+    if (len) {
+        buf[len] = '\0';
+        log_server_line(buf, &last);
+    }
+
+    sc_pipe_close(server->output_pipe);
+    return 0;
+}
+
+static sc_pid
+execute_server_captured(struct sc_server *server, const char *const *cmd) {
+    sc_pid pid;
+    enum sc_process_result r =
+        sc_process_execute_p(cmd, &pid, 0, NULL, &server->output_pipe, NULL);
+    if (r != SC_PROCESS_SUCCESS) {
+        LOGE("Could not execute the server");
+        return SC_PROCESS_NONE;
+    }
+
+    bool ok = sc_thread_create(&server->output_thread, run_server_output,
+                               "scrcpy-srv-out", server);
+    if (!ok) {
+        LOGW("Could not read the server output");
+        // Not fatal, but the pipe must be drained to avoid blocking the
+        // server: close it (the server output is lost)
+        sc_pipe_close(server->output_pipe);
+        return pid;
+    }
+    server->output_thread_started = true;
+    return pid;
+}
+
+// Wait for the end of the server output (the server process must be
+// terminated)
+static void
+join_server_output(struct sc_server *server) {
+    if (server->output_thread_started) {
+        sc_thread_join(&server->output_thread, NULL);
+        server->output_thread_started = false;
+    }
+}
+
 static sc_pid
 execute_server(struct sc_server *server,
                const struct sc_server_params *params) {
@@ -475,8 +593,14 @@ execute_server(struct sc_server *server,
     //     Port: 5005
     // Then click on "Debug"
 #endif
-    // Inherit both stdout and stderr (all server logs are printed to stdout)
-    pid = sc_adb_execute(cmd, 0);
+    if (params->capture_output) {
+        // scrcpy-gui: read the server logs (printed to stdout) to show them
+        pid = execute_server_captured(server, cmd);
+    } else {
+        // Inherit both stdout and stderr (all server logs are printed to
+        // stdout)
+        pid = sc_adb_execute(cmd, 0);
+    }
 
 end:
     for (unsigned i = dyn_idx; i < count; ++i) {
@@ -578,6 +702,7 @@ sc_server_init(struct sc_server *server, const struct sc_server_params *params,
     server->video_socket = SC_SOCKET_NONE;
     server->audio_socket = SC_SOCKET_NONE;
     server->control_socket = SC_SOCKET_NONE;
+    server->output_thread_started = false;
 
     sc_adb_tunnel_init(&server->tunnel);
 
@@ -1103,6 +1228,7 @@ run_server(void *data) {
     if (!ok) {
         sc_process_terminate(pid);
         sc_process_wait(pid, true); // ignore exit code
+        join_server_output(server);
         sc_adb_tunnel_close(&server->tunnel, &server->intr, serial,
                             server->device_socket_name);
         goto error_connection_failed;
@@ -1115,6 +1241,7 @@ run_server(void *data) {
         sc_process_wait(pid, true); // ignore exit code
         sc_process_observer_join(&observer);
         sc_process_observer_destroy(&observer);
+        join_server_output(server);
         goto error_connection_failed;
     }
 
@@ -1165,6 +1292,7 @@ run_server(void *data) {
     sc_process_observer_destroy(&observer);
 
     sc_process_close(pid);
+    join_server_output(server);
 
     sc_server_kill_adb_if_requested(server);
 

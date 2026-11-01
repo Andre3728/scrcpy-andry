@@ -147,6 +147,10 @@ sc_process_execute_p(const char *const argv[], HANDLE *handle, unsigned flags,
     if (!inherit_stdout && !inherit_stderr) {
         // DETACHED_PROCESS to disable stdin, stdout and stderr
         dwCreationFlags |= DETACHED_PROCESS;
+    } else if (!GetConsoleWindow()) {
+        // No console to share (GUI application): do not let Windows create a
+        // console window for the child process
+        dwCreationFlags |= CREATE_NO_WINDOW;
     }
     BOOL ok = CreateProcessW(NULL, wide, NULL, NULL, bInheritHandles,
                              dwCreationFlags, NULL, NULL, &si.StartupInfo, &pi);

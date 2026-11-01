@@ -185,9 +185,14 @@ if host_machine.system() == 'windows'
     dependencies += cc.find_library('dwmapi')
     # scrcpy-gui: do not depend on the C++ runtime DLLs of the toolchain
     # (libstdc++ also uses winpthread internally)
-    exe_link_args += ['-static-libstdc++', '-static-libgcc',
-                      '-Wl,-Bstatic,--whole-archive', '-lwinpthread',
-                      '-Wl,--no-whole-archive,-Bdynamic']
+    if static
+        # Everything is linked statically (single-file build)
+        exe_link_args += ['-static']
+    else
+        exe_link_args += ['-static-libstdc++', '-static-libgcc',
+                          '-Wl,-Bstatic,--whole-archive', '-lwinpthread',
+                          '-Wl,--no-whole-archive,-Bdynamic']
+    endif
 endif
 
 check_functions = [
@@ -242,6 +247,25 @@ conf.set('HAVE_VIDEOTOOLBOX', videotoolbox_support)
 # enable HID over AOA support (linux only)
 conf.set('HAVE_USB', usb_support)
 
+# scrcpy-gui: single-file executable (Windows)
+bundle_dir = get_option('bundle_dir')
+bundle_support = bundle_dir != '' and host_machine.system() == 'windows'
+conf.set('SC_BUNDLE', bundle_support)
+if bundle_support
+    bundle_python = import('python').find_installation()
+    bundle_gen = custom_target('bundle',
+        output: ['bundle.rc', 'bundle_files.h'],
+        input: 'src/sys/win/gen_bundle.py',
+        command: [bundle_python, '@INPUT@', '@OUTPUT0@', '@OUTPUT1@',
+                  meson.project_source_root() / bundle_dir],
+        build_always_stale: true)
+    src += [
+        'src/sys/win/bundle.c',
+        bundle_gen[1],
+        windows.compile_resources(bundle_gen[0]),
+    ]
+endif
+
 configure_file(configuration: conf, output: 'config.h')
 
 src_dir = include_directories('src')
@@ -292,6 +316,9 @@ executable('scrcpy-gui', src,
            include_directories: src_dir,
            link_with: [gui_lib, cjson_lib],
            link_args: exe_link_args,
+           # scrcpy-gui: GUI application, no console window (the console of
+           # the parent terminal is attached in command line mode, see main.c)
+           win_subsystem: 'windows',
            install: true,
            c_args: [])
 

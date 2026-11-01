@@ -10,6 +10,7 @@
 #include "options.h"
 #include "util/intr.h"
 #include "util/net.h"
+#include "util/process.h"
 #include "util/thread.h"
 #include "util/tick.h"
 
@@ -77,6 +78,9 @@ struct sc_server_params {
     bool flex_display;
     bool ignore_video_encoder_constraints;
     uint8_t list;
+    // scrcpy-gui: read the server output and log it (instead of letting the
+    // server process write to the console)
+    bool capture_output;
 };
 
 struct sc_server {
@@ -98,6 +102,11 @@ struct sc_server {
     sc_socket video_socket;
     sc_socket audio_socket;
     sc_socket control_socket;
+
+    // scrcpy-gui: server output reader (if params.capture_output)
+    sc_pipe output_pipe;
+    sc_thread output_thread;
+    bool output_thread_started;
 
     const struct sc_server_callbacks *cbs;
     void *cbs_userdata;

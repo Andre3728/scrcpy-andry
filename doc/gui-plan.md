@@ -341,12 +341,21 @@ Done:
 - User documentation: `doc/gui.md`, fork notice in `README.md`.
 - Disabled controls are more visibly disabled.
 
+Follow-up done after M7:
+- **Single-file exe** (`release/build_gui_windows_onefile.sh`, 27 MB):
+  SDL, minimal FFmpeg, dav1d and libusb built from source (`app/deps`) and
+  linked statically; adb, the server and the icons embedded as `RCDATA`
+  resources (`-Dbundle_dir`, `gen_bundle.py`) and extracted on first launch
+  to `%LOCALAPPDATA%\scrcpy-gui\runtime\<content hash>\` (`sys/win/bundle.c`).
+  Imports only system DLLs (checked by the script). Verified with only
+  `C:\Windows\System32` in `PATH`: extraction, bundled adb, server lookup.
+- GUI subsystem (no console window); in command line mode it attaches to the
+  parent console, except the streams redirected to a file or a pipe.
+- **Connection log** panel: the client logs (info and above) and the server
+  output (captured instead of inherited, parsed per level) are shown at the
+  bottom of the left panel.
+
 Not done (follow-ups):
-- **Single-file exe.** The MSYS2 package is a folder of ~115 files (59 MB
-  zipped) because MSYS2's FFmpeg is a full build. Next step: build with the
-  upstream release pipeline (`release/build_windows.sh`, minimal FFmpeg/SDL
-  built from source, ~10 files), then embed the DLLs, adb and server as
-  resources extracted on first run (or static-link SDL/FFmpeg).
 - Custom unified title bar (borderless + hit testing): replaced by the native
   title bar coloring above; revisit only if needed.
 - Clipboard image copy on Linux/macOS, adb version mismatch warning.

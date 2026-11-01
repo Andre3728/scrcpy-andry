@@ -91,6 +91,15 @@ sc_log_windows_error(const char *prefix, int error) {
 }
 #endif
 
+static sc_log_listener_fn log_listener;
+static void *log_listener_userdata;
+
+void
+sc_log_set_listener(sc_log_listener_fn fn, void *userdata) {
+    log_listener = fn;
+    log_listener_userdata = userdata;
+}
+
 static SDL_LogPriority
 sdl_priority_from_av_level(int level) {
     switch (level) {
@@ -147,6 +156,11 @@ sc_sdl_log_print(void *userdata, int category, SDL_LogPriority priority,
     assert(priority < SDL_LOG_PRIORITY_COUNT);
     const char *prio_name = sc_sdl_log_priority_names[priority];
     fprintf(out, "%s: %s\n", prio_name, message);
+
+    sc_log_listener_fn listener = log_listener;
+    if (listener) {
+        listener(log_listener_userdata, priority, message);
+    }
 }
 
 void
