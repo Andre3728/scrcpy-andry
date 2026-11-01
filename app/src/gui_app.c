@@ -1006,8 +1006,6 @@ apply_insets(struct sc_gui_app *app) {
     app->insets = sc_gui_get_insets(app->gui);
     struct sc_size new_reserved = get_reserved_size(app->insets);
 
-    update_minimum_size(app);
-
     SDL_WindowFlags flags = SDL_GetWindowFlags(app->window);
     if (!(flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED))) {
         int32_t dw = (int32_t) new_reserved.width - old_reserved.width;
@@ -1018,10 +1016,14 @@ apply_insets(struct sc_gui_app *app) {
             size.width = MAX(1, (int32_t) size.width + dw);
             size.height = MAX(1, (int32_t) size.height + dh);
             pos.x -= dw;
+            // Remove the minimum size while resizing (see
+            // sc_screen_handle_gui_insets_changed())
+            SDL_SetWindowMinimumSize(app->window, 0, 0);
             sc_sdl_set_window_size(app->window, size);
             sc_sdl_set_window_position(app->window, pos);
         }
     }
+    update_minimum_size(app);
 
     render(app);
 }

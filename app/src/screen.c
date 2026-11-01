@@ -689,31 +689,63 @@ sc_screen_handle_gui_action(struct sc_screen *screen,
 
 void
 sc_screen_handle_gui_insets_changed(struct sc_screen *screen) {
-    struct sc_size old_reserved = get_reserved_size(screen->gui_insets);
+    struct sc_gui_insets old_insets = screen->gui_insets;
     screen->gui_insets = sc_gui_get_insets(screen->gui);
-    struct sc_size new_reserved = get_reserved_size(screen->gui_insets);
 
-    update_window_minimum_size(screen);
-
-    if (!screen->window_shown) {
+    if (!screen->window_shown || !is_windowed(screen)
+            || !screen->content_size.width || !screen->content_size.height) {
+        update_window_minimum_size(screen);
+        if (screen->window_shown) {
+            sc_screen_render(screen, true);
+        }
         return;
     }
 
-    if (is_windowed(screen)) {
-        // Grow or shrink the window so that the video keeps its size, and
-        // move it so that the video stays at the same place on screen
-        int32_t dw = (int32_t) new_reserved.width - old_reserved.width;
-        int32_t dh = (int32_t) new_reserved.height - old_reserved.height;
-        if (dw || dh) {
-            struct sc_size size = sc_sdl_get_window_size(screen->window);
-            struct sc_point pos = sc_sdl_get_window_position(screen->window);
-            size.width = MAX(1, (int32_t) size.width + dw);
-            size.height = MAX(1, (int32_t) size.height + dh);
-            pos.x -= dw;
-            sc_sdl_set_window_size(screen->window, size);
-            sc_sdl_set_window_position(screen->window, pos);
-        }
-    }
+    struct sc_size old_reserved = get_reserved_size(old_insets);
+    struct sc_size new_reserved = get_reserved_size(screen->gui_insets);
+
+    // The video area before the change (the window size minus the old insets)
+    struct sc_size window_size = sc_sdl_get_window_size(screen->window);
+    struct sc_size area = {
+        .width = MAX(1, (int32_t) window_size.width - old_reserved.width),
+        .height = MAX(1, (int32_t) window_size.height - old_reserved.height),
+    };
+
+    // Fit the video area to the device screen (remove the black borders),
+    // within the display bounds
+    struct sc_size fitted =
+        get_optimal_size(area, screen->content_size, true, new_reserved);
+
+    // The GUI may require a minimum width (the video is then centered)
+    float min_w = 0;
+    float min_h = 0;
+    sc_gui_get_minimum_area(screen->gui, &min_w, &min_h);
+    struct sc_size new_area = {
+        .width = MAX(fitted.width, round_inset(min_w)),
+        .height = MAX(fitted.height, round_inset(min_h)),
+    };
+
+    // Keep the video at the same place on the screen
+    struct sc_point pos = sc_sdl_get_window_position(screen->window);
+    int32_t video_x = pos.x + (int32_t) screen->rect.x;
+    int32_t video_y = pos.y + (int32_t) screen->rect.y;
+    pos.x = video_x - round_inset(screen->gui_insets.left)
+          - ((int32_t) new_area.width - fitted.width) / 2;
+    pos.y = video_y - round_inset(screen->gui_insets.top)
+          - ((int32_t) new_area.height - fitted.height) / 2;
+
+    struct sc_size new_size = {
+        .width = new_area.width + new_reserved.width,
+        .height = new_area.height + new_reserved.height,
+    };
+
+    // Remove the minimum size while resizing: otherwise the system may
+    // enlarge the window to the new minimum before it is resized (which made
+    // the window grow twice), or refuse to shrink it
+    SDL_SetWindowMinimumSize(screen->window, 0, 0);
+    sc_sdl_set_window_size(screen->window, new_size);
+    sc_sdl_set_window_position(screen->window, pos);
+    update_window_minimum_size(screen);
 
     sc_screen_render(screen, true);
 }

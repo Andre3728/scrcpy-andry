@@ -30,8 +30,6 @@ constexpr float TOOLBAR_BUTTON_SIZE = 32.f;
 constexpr float DEFAULT_AREA_WIDTH = 420.f;
 constexpr float DEFAULT_AREA_HEIGHT = 760.f;
 
-constexpr int TOOLBAR_BUTTONS = 12;
-constexpr int TOOLBAR_SEPARATORS = 3;
 
 constexpr Uint64 TOAST_DURATION_MS = 4000;
 constexpr Uint64 TOAST_ERROR_DURATION_MS = 7000;
@@ -2285,16 +2283,136 @@ finish_drop(sc_gui *gui) {
     });
 }
 
-ImVec2
-toolbar_pill_size(sc_gui *gui) {
+// The toolbar adapts to the width of the mirror: the less important buttons
+// move to the "More" menu when there is not enough room, so that the window
+// can always fit the device screen exactly
+struct ToolbarLayout {
+    bool volume = true; // volume down/up
+    bool power = true;
+    bool rotate = true;
+    bool record = true;
+    float width = 0;
+    float height = 0;
+};
+
+float
+toolbar_width(sc_gui *gui, int buttons, int separators) {
     const float button = gui->s(TOOLBAR_BUTTON_SIZE);
     const float sep = gui->s(12);
     const float gap = gui->s(2);
     const float pad = gui->s(6);
-    float w = TOOLBAR_BUTTONS * button + TOOLBAR_SEPARATORS * sep
-            + (TOOLBAR_BUTTONS + TOOLBAR_SEPARATORS - 1) * gap + 2 * pad;
-    float h = button + 2 * pad;
-    return ImVec2(w, h);
+    return buttons * button + separators * sep
+         + (buttons + separators - 1) * gap + 2 * pad;
+}
+
+void
+toolbar_measure(sc_gui *gui, ToolbarLayout &l) {
+    // sidebar | back home recents | [vol- vol+ power rotate] | screenshot
+    // [record] transfers more
+    int buttons = 7 + 2 * l.volume + l.power + l.rotate + l.record;
+    bool hw_group = l.volume || l.power || l.rotate;
+    int separators = 2 + hw_group;
+    l.width = toolbar_width(gui, buttons, separators);
+    l.height = gui->s(TOOLBAR_BUTTON_SIZE) + 2 * gui->s(6);
+}
+
+ToolbarLayout
+toolbar_layout(sc_gui *gui, float available) {
+    ToolbarLayout l;
+    toolbar_measure(gui, l);
+    // Remove buttons by increasing importance until the toolbar fits
+    bool *optional[] = {&l.rotate, &l.record, &l.power, &l.volume};
+    for (bool *b : optional) {
+        if (l.width <= available) {
+            break;
+        }
+        *b = false;
+        toolbar_measure(gui, l);
+    }
+    return l;
+}
+
+ToolbarLayout
+toolbar_minimal_layout(sc_gui *gui) {
+    ToolbarLayout l;
+    l.volume = l.power = l.rotate = l.record = false;
+    toolbar_measure(gui, l);
+    return l;
+}
+
+ImVec2
+toolbar_pill_size(sc_gui *gui) {
+    ToolbarLayout l = toolbar_minimal_layout(gui);
+    return ImVec2(l.width, l.height);
+}
+
+void
+request_toggle_recording(sc_gui *gui) {
+    defer(gui, [gui] {
+        if (gui->cbs && gui->cbs->on_toggle_recording) {
+            gui->cbs->on_toggle_recording(gui->cbs_userdata);
+        }
+    });
+}
+
+void
+draw_more_menu(sc_gui *gui, const ToolbarLayout &l) {
+    struct Entry {
+        const char *icon;
+        const char *label;
+        sc_gui_action action;
+        bool separator_before;
+    };
+    std::vector<Entry> entries;
+    // Buttons which did not fit in the toolbar
+    if (!l.volume) {
+        entries.push_back({SC_ICON_VOLUME_1, "Volume down",
+                           SC_GUI_ACTION_VOLUME_DOWN, false});
+        entries.push_back({SC_ICON_VOLUME_2, "Volume up",
+                           SC_GUI_ACTION_VOLUME_UP, false});
+    }
+    if (!l.power) {
+        entries.push_back({SC_ICON_POWER, "Power", SC_GUI_ACTION_POWER,
+                           false});
+    }
+    if (!l.rotate) {
+        entries.push_back({SC_ICON_ROTATE_CW, "Rotate device",
+                           SC_GUI_ACTION_ROTATE_DEVICE, false});
+    }
+    bool overflow = !entries.empty() || !l.record;
+    entries.push_back({SC_ICON_BELL, "Notification panel",
+                       SC_GUI_ACTION_EXPAND_NOTIFICATION_PANEL, overflow});
+    entries.push_back({SC_ICON_SETTINGS, "Quick settings",
+                       SC_GUI_ACTION_EXPAND_SETTINGS_PANEL, false});
+    entries.push_back({SC_ICON_CHEVRONS_UP, "Collapse panels",
+                       SC_GUI_ACTION_COLLAPSE_PANELS, false});
+    entries.push_back({SC_ICON_MONITOR_OFF, "Turn device screen off",
+                       SC_GUI_ACTION_SCREEN_OFF, true});
+    entries.push_back({SC_ICON_MONITOR, "Turn device screen on",
+                       SC_GUI_ACTION_SCREEN_ON, false});
+
+    ImVec2 size(gui->s(220), 0);
+    if (!l.record) {
+        std::string label = std::string(SC_ICON_CIRCLE_DOT "   ")
+                          + (gui->recording ? "Stop recording"
+                                            : "Start recording");
+        if (ImGui::Selectable(label.c_str(), false, 0, size)) {
+            request_toggle_recording(gui);
+        }
+    }
+
+    bool control = gui->control;
+    for (const Entry &e : entries) {
+        if (e.separator_before) {
+            ImGui::Separator();
+        }
+        std::string label = std::string(e.icon) + "   " + e.label;
+        ImGuiSelectableFlags flags =
+            control ? 0 : ImGuiSelectableFlags_Disabled;
+        if (ImGui::Selectable(label.c_str(), false, flags, size)) {
+            run_action(gui, e.action);
+        }
+    }
 }
 
 void
@@ -2302,14 +2420,16 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     const float button = gui->s(TOOLBAR_BUTTON_SIZE);
     const float gap = gui->s(2);
     const float pad = gui->s(6);
-    ImVec2 pill = toolbar_pill_size(gui);
-    float pill_w = pill.x;
-    float pill_h = pill.y;
+    const float margin = gui->s(8);
+
+    ToolbarLayout l = toolbar_layout(gui, width - 2 * margin);
+    float pill_w = l.width;
+    float pill_h = l.height;
 
     float band_top = height - gui->s(TOOLBAR_HEIGHT);
     float x = left + (width - pill_w) / 2;
-    if (x < left + gui->s(8)) {
-        x = left + gui->s(8);
+    if (x < left + margin) {
+        x = left + margin;
     }
     float y = band_top + (gui->s(TOOLBAR_HEIGHT) - pill_h) / 2;
 
@@ -2326,6 +2446,9 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     dl->AddRectFilled(p0, p1, gui->pal.toolbar_bg, pill_h / 2);
     dl->AddRect(p0, p1, gui->pal.toolbar_border, pill_h / 2, 0, gui->s(1));
 
+    bool mirroring = is_mirroring(gui);
+    bool control = mirroring && gui->control;
+
     if (toolbar_button(gui, "##sidebar", SC_ICON_PANEL_LEFT,
                        gui->sidebar_visible ? "Hide sidebar" : "Show sidebar",
                        gui->sidebar_visible)) {
@@ -2338,7 +2461,8 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     toolbar_separator(gui);
     ImGui::SameLine();
 
-    ImGui::BeginDisabled(!is_mirroring(gui) || !gui->control);
+    // Navigation
+    ImGui::BeginDisabled(!control);
     if (toolbar_button(gui, "##back", SC_ICON_CHEVRON_LEFT, "Back")) {
         run_action(gui, SC_GUI_ACTION_BACK);
     }
@@ -2354,29 +2478,42 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     ImGui::EndDisabled();
     toolbar_separator(gui);
     ImGui::SameLine();
-    ImGui::BeginDisabled(!is_mirroring(gui) || !gui->control);
-    if (toolbar_button(gui, "##voldown", SC_ICON_VOLUME_1, "Volume down")) {
-        run_action(gui, SC_GUI_ACTION_VOLUME_DOWN);
+
+    // Hardware buttons
+    if (l.volume || l.power || l.rotate) {
+        ImGui::BeginDisabled(!control);
+        if (l.volume) {
+            if (toolbar_button(gui, "##voldown", SC_ICON_VOLUME_1,
+                               "Volume down")) {
+                run_action(gui, SC_GUI_ACTION_VOLUME_DOWN);
+            }
+            ImGui::SameLine();
+            if (toolbar_button(gui, "##volup", SC_ICON_VOLUME_2,
+                               "Volume up")) {
+                run_action(gui, SC_GUI_ACTION_VOLUME_UP);
+            }
+            ImGui::SameLine();
+        }
+        if (l.power) {
+            if (toolbar_button(gui, "##power", SC_ICON_POWER, "Power")) {
+                run_action(gui, SC_GUI_ACTION_POWER);
+            }
+            ImGui::SameLine();
+        }
+        if (l.rotate) {
+            if (toolbar_button(gui, "##rotate", SC_ICON_ROTATE_CW,
+                               "Rotate device")) {
+                run_action(gui, SC_GUI_ACTION_ROTATE_DEVICE);
+            }
+            ImGui::SameLine();
+        }
+        ImGui::EndDisabled();
+        toolbar_separator(gui);
+        ImGui::SameLine();
     }
-    ImGui::SameLine();
-    if (toolbar_button(gui, "##volup", SC_ICON_VOLUME_2, "Volume up")) {
-        run_action(gui, SC_GUI_ACTION_VOLUME_UP);
-    }
-    ImGui::SameLine();
-    if (toolbar_button(gui, "##power", SC_ICON_POWER, "Power")) {
-        run_action(gui, SC_GUI_ACTION_POWER);
-    }
-    ImGui::SameLine();
-    if (toolbar_button(gui, "##rotate", SC_ICON_ROTATE_CW, "Rotate device")) {
-        run_action(gui, SC_GUI_ACTION_ROTATE_DEVICE);
-    }
-    ImGui::SameLine();
-    ImGui::EndDisabled();
-    toolbar_separator(gui);
-    ImGui::SameLine();
 
     // Capture (no control needed)
-    ImGui::BeginDisabled(!is_mirroring(gui));
+    ImGui::BeginDisabled(!mirroring);
     if (toolbar_button(gui, "##screenshot", SC_ICON_CAMERA,
                        "Screenshot (saved to Pictures, copied to the "
                        "clipboard)")) {
@@ -2387,26 +2524,25 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
         });
     }
     ImGui::SameLine();
-    ImVec2 rec_pos = ImGui::GetCursorScreenPos();
-    if (toolbar_button(gui, "##record", SC_ICON_CIRCLE_DOT,
-                       gui->recording
-                           ? "Stop recording (mirroring restarts)"
-                           : "Record (saved to Videos; mirroring restarts)",
-                       gui->recording)) {
-        defer(gui, [gui] {
-            if (gui->cbs && gui->cbs->on_toggle_recording) {
-                gui->cbs->on_toggle_recording(gui->cbs_userdata);
-            }
-        });
-    }
-    if (gui->recording) {
-        // Red record icon
-        ImDrawList *rdl = ImGui::GetWindowDrawList();
-        ImVec2 c = rec_pos + ImVec2(button / 2, button / 2);
-        rdl->AddCircleFilled(c, gui->s(5), gui->pal.error);
+    if (l.record) {
+        ImVec2 rec_pos = ImGui::GetCursorScreenPos();
+        if (toolbar_button(gui, "##record", SC_ICON_CIRCLE_DOT,
+                           gui->recording
+                               ? "Stop recording (mirroring restarts)"
+                               : "Record (saved to Videos; mirroring "
+                                 "restarts)",
+                           gui->recording)) {
+            request_toggle_recording(gui);
+        }
+        if (gui->recording) {
+            // Red record icon
+            ImDrawList *rdl = ImGui::GetWindowDrawList();
+            ImVec2 c = rec_pos + ImVec2(button / 2, button / 2);
+            rdl->AddCircleFilled(c, gui->s(5), gui->pal.error);
+        }
+        ImGui::SameLine();
     }
     ImGui::EndDisabled();
-    ImGui::SameLine();
 
     // Transfers (enabled even without a session, to see the history)
     int active = 0;
@@ -2434,7 +2570,7 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     }
     ImGui::SameLine();
 
-    ImGui::BeginDisabled(!is_mirroring(gui) || !gui->control);
+    ImGui::BeginDisabled(!mirroring);
     ImVec2 more_pos = ImGui::GetCursorScreenPos();
     if (toolbar_button(gui, "##more", SC_ICON_ELLIPSIS, "More")) {
         ImGui::OpenPopup("##more_menu");
@@ -2450,34 +2586,7 @@ draw_toolbar(sc_gui *gui, float left, float width, float height) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,
                         ImVec2(gui->s(8), gui->s(4)));
     if (ImGui::BeginPopup("##more_menu")) {
-        struct {
-            const char *icon;
-            const char *label;
-            sc_gui_action action;
-        } entries[] = {
-            {SC_ICON_BELL, "Notification panel",
-                SC_GUI_ACTION_EXPAND_NOTIFICATION_PANEL},
-            {SC_ICON_SETTINGS, "Quick settings",
-                SC_GUI_ACTION_EXPAND_SETTINGS_PANEL},
-            {SC_ICON_CHEVRONS_UP, "Collapse panels",
-                SC_GUI_ACTION_COLLAPSE_PANELS},
-            {SC_ICON_MONITOR_OFF, "Turn device screen off",
-                SC_GUI_ACTION_SCREEN_OFF},
-            {SC_ICON_MONITOR, "Turn device screen on",
-                SC_GUI_ACTION_SCREEN_ON},
-        };
-        int i = 0;
-        for (const auto &e : entries) {
-            if (i == 3) {
-                ImGui::Separator();
-            }
-            std::string label = std::string(e.icon) + "   " + e.label;
-            if (ImGui::Selectable(label.c_str(), false, 0,
-                                  ImVec2(gui->s(220), 0))) {
-                run_action(gui, e.action);
-            }
-            ++i;
-        }
+        draw_more_menu(gui, l);
         ImGui::EndPopup();
     }
     ImGui::PopStyleVar(2);
