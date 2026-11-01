@@ -1,3 +1,9 @@
+> [!NOTE]
+> **scrcpy-gui** is an unofficial fork of scrcpy which adds a desktop GUI
+> (device list, Wi-Fi pairing, file manager, drag & drop install, settings,
+> screenshots). See [doc/gui.md](doc/gui.md). It is not affiliated with
+> Genymobile; the rest of this README is the upstream documentation.
+
 > [!WARNING]
 > **This GitHub repo (<https://github.com/Genymobile/scrcpy>) is the only official
 source for the project. Do not download releases from random websites, even if

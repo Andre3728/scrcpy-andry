@@ -224,6 +224,11 @@ sc_gui_get_minimum_area(struct sc_gui *gui, float *width, float *height);
 void
 sc_gui_get_default_area(struct sc_gui *gui, float *width, float *height);
 
+// Colors for the native title bar (0xRRGGBB), and whether the theme is dark
+void
+sc_gui_get_titlebar_colors(struct sc_gui *gui, uint32_t *caption,
+                           uint32_t *text, bool *dark);
+
 // Background color to clear the window with (0xRRGGBB)
 uint32_t
 sc_gui_get_background_color(struct sc_gui *gui);

@@ -1,0 +1,56 @@
+name: scrcpy-gui
+
+# Build and test scrcpy-gui on Windows (MSYS2 UCRT64), and publish the portable
+# package as an artifact. Releases with minimal dependencies use the upstream
+# pipeline (release.yml).
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            unzip
+            zip
+            wget
+          pacboy: >-
+            gcc:p
+            meson:p
+            ninja:p
+            pkgconf:p
+            sdl3:p
+            ffmpeg:p
+            libusb:p
+
+      - name: Unit tests (debug build)
+        run: |
+          meson setup build-test --buildtype=debug -Dcompile_server=false
+          ninja -C build-test
+          meson test -C build-test --print-errorlogs
+
+      - name: Portable package
+        run: release/build_gui_windows.sh
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrcpy-gui-win64
+          path: dist/scrcpy-gui-win64-*/
+          if-no-files-found: error

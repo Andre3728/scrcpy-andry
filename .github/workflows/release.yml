@@ -247,7 +247,7 @@ jobs:
       - name: Check DLL dependencies
         run: |
             cd release/work/build-winarm64/dist
-            imports=$(llvm-objdump -p scrcpy.exe *.dll | sed -n 's/^ *DLL Name: //p' | sort -u)
+            imports=$(llvm-objdump -p scrcpy-gui.exe *.dll | sed -n 's/^ *DLL Name: //p' | sort -u)
             echo "$imports"
             # The binaries must not depend on DLLs provided by the MSYS2
             # toolchain, which are not part of the release

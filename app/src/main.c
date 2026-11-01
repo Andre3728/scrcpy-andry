@@ -62,6 +62,15 @@ main_scrcpy(int argc, char *argv[]) {
         args.opts.gui = true;
     }
 
+#ifdef _WIN32
+    if (args.opts.gui && args.pause_on_exit == SC_PAUSE_ON_EXIT_IF_ERROR) {
+        // Launched by double-click (see scrcpy_parse_args()): the GUI does not
+        // need the console window created for it
+        FreeConsole();
+        args.pause_on_exit = SC_PAUSE_ON_EXIT_FALSE;
+    }
+#endif
+
     sc_set_log_level(args.opts.log_level);
 
     if (args.opts.update_terminal_title) {

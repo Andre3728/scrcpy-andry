@@ -9,6 +9,17 @@
 #ifdef _WIN32
 # include <winsock2.h>
 # include <windows.h>
+# include <dwmapi.h>
+// Not defined by older SDK headers
+# ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#  define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+# endif
+# ifndef DWMWA_CAPTION_COLOR
+#  define DWMWA_CAPTION_COLOR 35
+# endif
+# ifndef DWMWA_TEXT_COLOR
+#  define DWMWA_TEXT_COLOR 36
+# endif
 #endif
 
 #include "adb/adb.h"
@@ -143,6 +154,12 @@ struct sc_gui_app {
     const char *recording_path;
     bool stop_requested;
     bool quit;
+
+    // Title bar colors currently applied (Windows)
+    uint32_t titlebar_caption;
+    uint32_t titlebar_text;
+    bool titlebar_dark;
+    bool titlebar_set;
 
     // The server keeps pointers to the options strings until the end of the
     // program, so the serials passed to sessions are kept until exit
@@ -901,6 +918,55 @@ cancel_transfer(struct sc_gui_app *app, uint32_t id) {
     }
 }
 
+// Match the native title bar with the theme (Windows 11; dark mode only on
+// Windows 10)
+static void
+update_titlebar(struct sc_gui_app *app) {
+#ifdef _WIN32
+    uint32_t caption;
+    uint32_t text;
+    bool dark;
+    sc_gui_get_titlebar_colors(app->gui, &caption, &text, &dark);
+    if (app->titlebar_set && caption == app->titlebar_caption
+            && text == app->titlebar_text && dark == app->titlebar_dark) {
+        return;
+    }
+    app->titlebar_caption = caption;
+    app->titlebar_text = text;
+    app->titlebar_dark = dark;
+    app->titlebar_set = true;
+
+    HWND hwnd = SDL_GetPointerProperty(SDL_GetWindowProperties(app->window),
+                                       SDL_PROP_WINDOW_WIN32_HWND_POINTER,
+                                       NULL);
+    if (!hwnd) {
+        return;
+    }
+    BOOL dark_mode = dark;
+    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark_mode,
+                          sizeof(dark_mode));
+    COLORREF caption_color = RGB((caption >> 16) & 0xFF,
+                                 (caption >> 8) & 0xFF, caption & 0xFF);
+    COLORREF text_color = RGB((text >> 16) & 0xFF, (text >> 8) & 0xFF,
+                              text & 0xFF);
+    // These fail on Windows 10, which is fine
+    DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &caption_color,
+                          sizeof(caption_color));
+    DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR, &text_color,
+                          sizeof(text_color));
+#else
+    (void) app;
+#endif
+}
+
+// Show a fatal error to the user (the console may not be visible)
+static void
+show_fatal_error(const char *message) {
+    LOGE("%s", message);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "scrcpy-gui", message,
+                             NULL);
+}
+
 // ---------------------------------------------------------------- rendering
 
 static void
@@ -964,6 +1030,7 @@ apply_insets(struct sc_gui_app *app) {
 static void
 handle_gui_event(struct sc_gui_app *app, const SDL_Event *event) {
     sc_gui_handle_event(app->gui, event, NULL);
+    update_titlebar(app);
     bool redraw = sc_gui_take_redraw_request(app->gui);
     switch (event->type) {
         case SDL_EVENT_WINDOW_EXPOSED:
@@ -1613,6 +1680,8 @@ host_handle_event(const SDL_Event *event, bool has_screen, void *userdata) {
     if (handle_app_event(app, event)) {
         return true;
     }
+    // The theme may have changed (system theme, Settings)
+    update_titlebar(app);
     if (!has_screen) {
         // Waiting for the server: keep the GUI alive. Do not consume the
         // events, the session must still see quit/stop/server events.
@@ -1863,7 +1932,10 @@ scrcpy_gui(struct scrcpy_options *options) {
     options->window = true;
 
     if (!SDL_Init(SDL_INIT_EVENTS | SDL_INIT_VIDEO)) {
-        LOGE("Could not initialize SDL: %s", SDL_GetError());
+        char msg[512];
+        snprintf(msg, sizeof(msg), "Could not initialize SDL: %s",
+                 SDL_GetError());
+        show_fatal_error(msg);
         return SCRCPY_EXIT_FAILURE;
     }
     atexit(SDL_Quit);
@@ -1889,10 +1961,13 @@ scrcpy_gui(struct scrcpy_options *options) {
     }
 
     if (!sc_adb_init()) {
+        show_fatal_error("Could not initialize adb.");
         return SCRCPY_EXIT_FAILURE;
     }
 
     if (!create_window(app)) {
+        show_fatal_error("Could not create the window. Check the graphics "
+                         "drivers, or try --render-driver=opengl.");
         goto end_adb;
     }
 
@@ -1926,7 +2001,7 @@ scrcpy_gui(struct scrcpy_options *options) {
     };
     app->gui = sc_gui_create(&gui_params);
     if (!app->gui) {
-        LOGE("Could not initialize the GUI");
+        show_fatal_error("Could not initialize the GUI.");
         goto end_window;
     }
 
@@ -1968,6 +2043,7 @@ scrcpy_gui(struct scrcpy_options *options) {
 
     sc_gui_set_prefs(app->gui, &app->config.prefs);
     sc_gui_set_profile(app->gui, &app->config.defaults, "Default");
+    update_titlebar(app);
 
     show_window(app);
 

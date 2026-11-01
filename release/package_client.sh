@@ -22,7 +22,7 @@ fi
 
 BUILD_DIR="$WORK_DIR/build-$1"
 ARCHIVE_DIR="$BUILD_DIR/release-archive"
-TARGET_DIRNAME="scrcpy-$1-$VERSION"
+TARGET_DIRNAME="scrcpy-gui-$1-$VERSION"
 
 rm -rf "$ARCHIVE_DIR/$TARGET_DIRNAME"
 mkdir -p "$ARCHIVE_DIR/$TARGET_DIRNAME"

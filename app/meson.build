@@ -177,9 +177,17 @@ if usb_support
     dependencies += dependency('libusb-1.0', static: static)
 endif
 
+exe_link_args = []
 if host_machine.system() == 'windows'
     dependencies += cc.find_library('mingw32')
     dependencies += cc.find_library('ws2_32')
+    # scrcpy-gui: title bar colors
+    dependencies += cc.find_library('dwmapi')
+    # scrcpy-gui: do not depend on the C++ runtime DLLs of the toolchain
+    # (libstdc++ also uses winpthread internally)
+    exe_link_args += ['-static-libstdc++', '-static-libgcc',
+                      '-Wl,-Bstatic,--whole-archive', '-lwinpthread',
+                      '-Wl,--no-whole-archive,-Bdynamic']
 endif
 
 check_functions = [
@@ -283,6 +291,7 @@ executable('scrcpy-gui', src,
            dependencies: dependencies,
            include_directories: src_dir,
            link_with: [gui_lib, cjson_lib],
+           link_args: exe_link_args,
            install: true,
            c_args: [])
 

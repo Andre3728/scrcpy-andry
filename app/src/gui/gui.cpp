@@ -421,6 +421,8 @@ apply_style(sc_gui *gui) {
     style.PopupBorderSize = 1;
     style.FrameBorderSize = 0;
     style.SeparatorTextBorderSize = 1;
+    // Make disabled controls (e.g. an accent button) clearly inactive
+    style.DisabledAlpha = 0.35f;
 
     ImVec4 *c = style.Colors;
     auto f4 = [](ImU32 col) { return ImGui::ColorConvertU32ToFloat4(col); };
@@ -2707,6 +2709,19 @@ void
 sc_gui_get_default_area(struct sc_gui *gui, float *width, float *height) {
     *width = gui->s(DEFAULT_AREA_WIDTH);
     *height = gui->s(DEFAULT_AREA_HEIGHT);
+}
+
+void
+sc_gui_get_titlebar_colors(struct sc_gui *gui, uint32_t *caption,
+                           uint32_t *text, bool *dark) {
+    // ImU32 is 0xAABBGGRR
+    auto to_rgb = [](ImU32 c) {
+        return ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
+    };
+    // Same color as the sidebar, for a unified look
+    *caption = to_rgb(gui->pal.sidebar_bg);
+    *text = to_rgb(gui->pal.text);
+    *dark = gui->dark;
 }
 
 uint32_t

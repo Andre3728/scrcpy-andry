@@ -49,18 +49,18 @@ meson setup "$LINUX_BUILD_DIR" \
 ninja -C "$LINUX_BUILD_DIR"
 
 # libva is loaded at runtime, so that scrcpy also runs where it is not installed
-if readelf -d "$LINUX_BUILD_DIR/app/scrcpy" | grep -qE 'NEEDED.*libva'
+if readelf -d "$LINUX_BUILD_DIR/app/scrcpy-gui" | grep -qE 'NEEDED.*libva'
 then
     echo "The scrcpy binary must not depend on libva," \
          "functions missing from app/src/vaapi_shim.c:" >&2
-    nm -D --undefined-only "$LINUX_BUILD_DIR/app/scrcpy" \
+    nm -D --undefined-only "$LINUX_BUILD_DIR/app/scrcpy-gui" \
         | awk '{print $2}' | grep -E '^(va|drm)[A-Z]' >&2
     exit 1
 fi
 
 # Group intermediate outputs into a 'dist' directory
 mkdir -p "$LINUX_BUILD_DIR/dist"
-cp "$LINUX_BUILD_DIR"/app/scrcpy "$LINUX_BUILD_DIR/dist/"
+cp "$LINUX_BUILD_DIR"/app/scrcpy-gui "$LINUX_BUILD_DIR/dist/"
 cp app/data/scrcpy.png "$LINUX_BUILD_DIR/dist/"
 cp app/data/disconnected.png "$LINUX_BUILD_DIR/dist/"
 cp app/scrcpy.1 "$LINUX_BUILD_DIR/dist/"

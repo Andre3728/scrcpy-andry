@@ -5,8 +5,9 @@ desktop GUI: a macOS-inspired sidebar on the left and the device mirror on the
 right, with first-class ADB features (APK install, file transfer, …) and
 drag & drop everywhere.
 
-Status: **planned** — decisions below were settled in a design session
-(2026-11-02). Change them deliberately, not silently.
+Status: **M1–M6 implemented, M7 partly** (see Progress). Decisions below were
+settled in a design session (2026-11-02). Change them deliberately, not
+silently.
 
 
 ## Product decisions
@@ -317,6 +318,38 @@ Each milestone is usable and mergeable on its own.
   overwrite the file).
 - Toolbar: 12 buttons (32 px) in 4 groups: sidebar | back, home, recents |
   volume, power, rotate | screenshot, record, transfers, more.
+
+### M7 — Polish and packaging (partly done)
+
+Done:
+- Native title bar matched to the theme (Windows: dark mode attribute +
+  caption/text colors = sidebar color on Windows 11), instead of a custom
+  borderless title bar: same unified look, keeps Snap Layouts and native
+  behavior.
+- Double-click launch in GUI mode frees the console window; fatal startup
+  errors are shown in a message box.
+- The C++ runtime and winpthread are linked statically on Windows
+  (`scrcpy-gui.exe` only imports SDL3, FFmpeg and system DLLs).
+- `release/build_gui_windows.sh`: portable build with MSYS2 (exe, DLLs,
+  adb 37.0.1, prebuilt server, licenses) + zip, with a missing-DLL check.
+  Verified: the package runs with only `C:\Windows\System32` in `PATH`.
+- Upstream release scripts and `release.yml` updated for the `scrcpy-gui`
+  binary name; `app/deps/_init` falls back to `sha256sum` when `shasum` is
+  missing.
+- `.github/workflows/gui.yml`: Windows build + unit tests + package artifact
+  (not run yet: needs a push to GitHub).
+- User documentation: `doc/gui.md`, fork notice in `README.md`.
+- Disabled controls are more visibly disabled.
+
+Not done (follow-ups):
+- **Single-file exe.** The MSYS2 package is a folder of ~115 files (59 MB
+  zipped) because MSYS2's FFmpeg is a full build. Next step: build with the
+  upstream release pipeline (`release/build_windows.sh`, minimal FFmpeg/SDL
+  built from source, ~10 files), then embed the DLLs, adb and server as
+  resources extracted on first run (or static-link SDL/FFmpeg).
+- Custom unified title bar (borderless + hit testing): replaced by the native
+  title bar coloring above; revisit only if needed.
+- Clipboard image copy on Linux/macOS, adb version mismatch warning.
 
 
 ## Build and test
