@@ -31,6 +31,8 @@ enum {
     SC_EVENT_GUI_TASK_DONE,
     // A transfer changed state (data1: struct sc_gui_transfer_update *)
     SC_EVENT_GUI_TRANSFER,
+    // A folder was chosen to save files (data1: struct sc_gui_pull_request *)
+    SC_EVENT_GUI_FOLDER_CHOSEN,
 };
 
 bool

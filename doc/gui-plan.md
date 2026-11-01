@@ -275,6 +275,29 @@ Each milestone is usable and mergeable on its own.
 - Pure helpers in `gui_util.c` with unit test `test_gui_util` (error
   extraction checked against real `adb install` output from the device).
 
+### M5 — File manager (implemented, actions need hands-on)
+
+- Files page: back / forward / up / refresh / new folder / locations
+  (Internal storage, DCIM, Download, Documents, Pictures, Movies, Music,
+  root), clickable breadcrumb, sort by name / date / size (folders first),
+  two-line rows (name, size or "Folder", date) to fit the narrow pane.
+- Click selects, Ctrl+click multi-selects, double-click opens a folder or
+  downloads a file. Context menu: Open, Download, Save to..., Delete. A footer
+  with the same actions appears when files are selected.
+- Download goes to the computer's Downloads folder, or to a folder chosen in
+  the native dialog (`SDL_ShowOpenFolderDialog`), through the transfer queue
+  (`adb pull`).
+- Delete asks for confirmation (`rm -rf`, quoted; `/`, `/sdcard` and
+  `/storage/emulated/0` are refused). New folder: `mkdir -p`.
+- Drop on a folder row copies into it, drop on the list copies into the
+  current folder (highlighted); the mirror overlay is hidden in that case.
+- Listing: `adb shell ls -la '<dir>/'` on the device worker, parsed by
+  `sc_gui_parse_ls()` (unit tested with real toybox output, spaces,
+  symlinks, devices, errors). The device poll no longer runs after every
+  file operation.
+- The last opened page is remembered (`"page"` in config.json).
+- Verified on device: /sdcard/ listing rendered correctly.
+
 
 ## Build and test
 

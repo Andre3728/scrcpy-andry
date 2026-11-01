@@ -66,6 +66,13 @@ struct sc_gui_profile {
     char extra_args[256];    // additional scrcpy arguments
 };
 
+enum sc_gui_page {
+    SC_GUI_PAGE_DEVICES,
+    SC_GUI_PAGE_FILES,
+    SC_GUI_PAGE_APPS,
+    SC_GUI_PAGE_SETTINGS,
+};
+
 enum sc_gui_appearance {
     SC_GUI_APPEARANCE_SYSTEM,
     SC_GUI_APPEARANCE_LIGHT,
@@ -76,12 +83,29 @@ enum sc_gui_appearance {
 struct sc_gui_prefs {
     enum sc_gui_appearance appearance;
     bool sidebar_visible;
+    enum sc_gui_page page; // last page opened
     char adb_path[512]; // empty: default
 };
 
 enum sc_gui_transfer_type {
     SC_GUI_TRANSFER_INSTALL, // adb install
     SC_GUI_TRANSFER_PUSH,    // adb push
+    SC_GUI_TRANSFER_PULL,    // adb pull
+};
+
+enum sc_gui_file_type {
+    SC_GUI_FILE_REGULAR,
+    SC_GUI_FILE_DIRECTORY,
+    SC_GUI_FILE_LINK,
+    SC_GUI_FILE_OTHER,
+};
+
+// A file on the device, for the file manager
+struct sc_gui_file {
+    const char *name;
+    const char *mtime; // "YYYY-MM-DD HH:MM"
+    uint64_t size;
+    enum sc_gui_file_type type;
 };
 
 enum sc_gui_transfer_state {
@@ -119,6 +143,16 @@ struct sc_gui_callbacks {
     void (*on_drop_files)(const char *const *paths, size_t count,
                           const char *remote_dir, void *userdata);
     void (*on_cancel_transfer)(uint32_t id, void *userdata);
+
+    // File manager (paths on the device; directories end with '/')
+    void (*on_list_dir)(const char *path, void *userdata);
+    void (*on_delete_files)(const char *const *paths, size_t count,
+                            void *userdata);
+    void (*on_create_dir)(const char *path, void *userdata);
+    // Download files to the computer, in the Downloads folder, or in a
+    // folder chosen by the user
+    void (*on_pull_files)(const char *const *paths, size_t count,
+                          bool choose_folder, void *userdata);
 };
 
 struct sc_gui_params {
@@ -224,6 +258,17 @@ void
 sc_gui_update_transfer(struct sc_gui *gui, uint32_t id,
                        enum sc_gui_transfer_type type, const char *name,
                        enum sc_gui_transfer_state state, const char *detail);
+
+// Set the content of a directory requested by on_list_dir() (the data is
+// copied). error is NULL on success.
+void
+sc_gui_set_listing(struct sc_gui *gui, const char *path,
+                   const struct sc_gui_file *files, size_t count,
+                   const char *error);
+
+// The files on the device changed (delete, new folder): reload the listing
+void
+sc_gui_files_changed(struct sc_gui *gui);
 
 // Indicate that a background device task (Wi-Fi switch, pairing...) is running
 void

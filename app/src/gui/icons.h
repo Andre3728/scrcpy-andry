@@ -41,5 +41,11 @@
 #define SC_ICON_CIRCLE_CHECK       ""
 #define SC_ICON_CIRCLE_X           ""
 #define SC_ICON_UNPLUG             ""
+#define SC_ICON_FILE               ""
+#define SC_ICON_CHEVRON_RIGHT      ""
+#define SC_ICON_ARROW_UP           ""
+#define SC_ICON_FOLDER_PLUS        ""
+#define SC_ICON_MAP_PIN            ""
+#define SC_ICON_TRASH              ""
 
 #endif

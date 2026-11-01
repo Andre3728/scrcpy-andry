@@ -29,6 +29,7 @@ static void test_round_trip(void) {
 
     config.prefs.appearance = SC_GUI_APPEARANCE_DARK;
     config.prefs.sidebar_visible = false;
+    config.prefs.page = SC_GUI_PAGE_FILES;
     strcpy(config.prefs.adb_path, "C:\\tools\\adb.exe");
     strcpy(config.last_serial, "192.168.1.2:5555");
     config.defaults.max_size = 1024;
@@ -56,6 +57,7 @@ static void test_round_trip(void) {
 
     assert(loaded.prefs.appearance == SC_GUI_APPEARANCE_DARK);
     assert(!loaded.prefs.sidebar_visible);
+    assert(loaded.prefs.page == SC_GUI_PAGE_FILES);
     assert(!strcmp(loaded.prefs.adb_path, "C:\\tools\\adb.exe"));
     assert(!strcmp(loaded.last_serial, "192.168.1.2:5555"));
     assert(loaded.defaults.max_size == 1024);

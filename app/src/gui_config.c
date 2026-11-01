@@ -32,6 +32,7 @@ sc_gui_config_init(struct sc_gui_config *config) {
     memset(config, 0, sizeof(*config));
     config->prefs.appearance = SC_GUI_APPEARANCE_SYSTEM;
     config->prefs.sidebar_visible = true;
+    config->prefs.page = SC_GUI_PAGE_DEVICES;
     config->prefs.adb_path[0] = '\0';
     sc_gui_profile_init(&config->defaults);
     config->devices = NULL;
@@ -103,6 +104,8 @@ sc_gui_config_set_profile(struct sc_gui_config *config, const char *serial,
 
 static const char *const codec_names[] = {"h264", "h265", "av1"};
 static const char *const appearance_names[] = {"system", "light", "dark"};
+static const char *const page_names[] = {"devices", "files", "apps",
+                                         "settings"};
 
 static int
 find_name(const char *const *names, int count, const char *name) {
@@ -199,6 +202,7 @@ sc_gui_config_to_json(const struct sc_gui_config *config) {
                             appearance_names[config->prefs.appearance]);
     cJSON_AddBoolToObject(root, "sidebar_visible",
                           config->prefs.sidebar_visible);
+    cJSON_AddStringToObject(root, "page", page_names[config->prefs.page]);
     cJSON_AddStringToObject(root, "adb_path", config->prefs.adb_path);
     cJSON_AddStringToObject(root, "last_serial", config->last_serial);
     cJSON_AddItemToObject(root, "defaults",
@@ -230,6 +234,12 @@ sc_gui_config_from_json(struct sc_gui_config *config, const char *json) {
         config->prefs.appearance = (enum sc_gui_appearance) index;
     }
     read_bool(root, "sidebar_visible", &config->prefs.sidebar_visible);
+    char page[16] = "";
+    read_string(root, "page", page, sizeof(page));
+    index = find_name(page_names, 4, page);
+    if (index >= 0) {
+        config->prefs.page = (enum sc_gui_page) index;
+    }
     read_string(root, "adb_path", config->prefs.adb_path,
                 sizeof(config->prefs.adb_path));
     read_string(root, "last_serial", config->last_serial,

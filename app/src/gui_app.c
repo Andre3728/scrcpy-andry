@@ -26,6 +26,7 @@
 #include "util/log.h"
 #include "util/sdl.h"
 #include "util/str.h"
+#include "util/strbuf.h"
 #include "util/thread.h"
 #include "util/tick.h"
 
@@ -37,7 +38,17 @@ enum sc_gui_task_type {
     SC_GUI_TASK_PAIR,
     SC_GUI_TASK_CONNECT,
     SC_GUI_TASK_DISCONNECT,
+    // File manager
+    SC_GUI_TASK_LIST_DIR,
+    SC_GUI_TASK_DELETE,
+    SC_GUI_TASK_MKDIR,
 };
+
+static bool
+is_file_task(enum sc_gui_task_type type) {
+    return type == SC_GUI_TASK_LIST_DIR || type == SC_GUI_TASK_DELETE
+        || type == SC_GUI_TASK_MKDIR;
+}
 
 // A device operation executed by the worker thread
 struct sc_gui_task {
@@ -45,10 +56,15 @@ struct sc_gui_task {
     char *serial;  // SWITCH_TO_WIFI
     char *address; // PAIR, CONNECT, DISCONNECT; SWITCH_TO_WIFI (result)
     char *code;    // PAIR
+    char *path;    // LIST_DIR, MKDIR
+    char **paths;  // DELETE
+    size_t path_count;
 
     // Result
     bool success;
     const char *error; // static string, may be NULL
+    struct sc_gui_listing listing; // LIST_DIR
+    char error_buf[256]; // file tasks
 
     struct sc_gui_task *next;
 };
@@ -222,7 +238,111 @@ sc_gui_task_destroy(struct sc_gui_task *task) {
     free(task->serial);
     free(task->address);
     free(task->code);
+    free(task->path);
+    for (size_t i = 0; i < task->path_count; ++i) {
+        free(task->paths[i]);
+    }
+    free(task->paths);
+    sc_gui_listing_destroy(&task->listing);
     free(task);
+}
+
+// Run a shell command on the device, capturing its output
+static bool
+run_shell(struct sc_gui_app *app, const char *serial, const char *cmd,
+          char *out, size_t out_size) {
+    const char *const args[] = {"-s", serial, "shell", cmd, NULL};
+    return sc_adb_run_capture(&app->intr, args, out, out_size);
+}
+
+#define SC_GUI_LS_BUFSIZE (4 * 1024 * 1024)
+
+static void
+run_task_list_dir(struct sc_gui_app *app, struct sc_gui_task *task) {
+    char *quoted = sc_gui_shell_quote(task->path);
+    char *cmd = quoted ? sc_str_concat("ls -la ", quoted) : NULL;
+    free(quoted);
+    char *out = malloc(SC_GUI_LS_BUFSIZE);
+    if (!cmd || !out) {
+        LOG_OOM();
+        free(cmd);
+        free(out);
+        return;
+    }
+
+    // ls returns an error code if a file cannot be read, but the listing is
+    // still useful: parse the output in all cases
+    run_shell(app, task->serial, cmd, out, SC_GUI_LS_BUFSIZE);
+    task->success = sc_gui_parse_ls(out, &task->listing);
+    free(cmd);
+    free(out);
+}
+
+// Paths which must never be deleted recursively
+static bool
+is_protected_path(const char *path) {
+    static const char *const protected[] = {
+        "", "/", "/sdcard", "/sdcard/", "/storage", "/storage/",
+        "/storage/emulated", "/storage/emulated/", "/storage/emulated/0",
+        "/storage/emulated/0/",
+    };
+    for (size_t i = 0; i < sizeof(protected) / sizeof(*protected); ++i) {
+        if (!strcmp(path, protected[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void
+run_task_delete(struct sc_gui_app *app, struct sc_gui_task *task) {
+    struct sc_strbuf buf;
+    if (!sc_strbuf_init(&buf, 256)) {
+        LOG_OOM();
+        return;
+    }
+    sc_strbuf_append_staticstr(&buf, "rm -rf");
+    for (size_t i = 0; i < task->path_count; ++i) {
+        if (is_protected_path(task->paths[i])) {
+            snprintf(task->error_buf, sizeof(task->error_buf),
+                     "Refusing to delete %s", task->paths[i]);
+            free(buf.s);
+            return;
+        }
+        char *quoted = sc_gui_shell_quote(task->paths[i]);
+        if (!quoted) {
+            LOG_OOM();
+            free(buf.s);
+            return;
+        }
+        sc_strbuf_append_char(&buf, ' ');
+        sc_strbuf_append(&buf, quoted, strlen(quoted));
+        free(quoted);
+    }
+
+    char out[1024];
+    task->success = run_shell(app, task->serial, buf.s, out, sizeof(out));
+    if (!task->success) {
+        sc_gui_adb_error(out, task->error_buf, sizeof(task->error_buf));
+    }
+    free(buf.s);
+}
+
+static void
+run_task_mkdir(struct sc_gui_app *app, struct sc_gui_task *task) {
+    char *quoted = sc_gui_shell_quote(task->path);
+    char *cmd = quoted ? sc_str_concat("mkdir -p ", quoted) : NULL;
+    free(quoted);
+    if (!cmd) {
+        LOG_OOM();
+        return;
+    }
+    char out[1024];
+    task->success = run_shell(app, task->serial, cmd, out, sizeof(out));
+    if (!task->success) {
+        sc_gui_adb_error(out, task->error_buf, sizeof(task->error_buf));
+    }
+    free(cmd);
 }
 
 static void
@@ -291,6 +411,15 @@ run_task(struct sc_gui_app *app, struct sc_gui_task *task) {
             task->success = sc_adb_disconnect(intr, task->address,
                                               SC_ADB_SILENT);
             break;
+        case SC_GUI_TASK_LIST_DIR:
+            run_task_list_dir(app, task);
+            break;
+        case SC_GUI_TASK_DELETE:
+            run_task_delete(app, task);
+            break;
+        case SC_GUI_TASK_MKDIR:
+            run_task_mkdir(app, task);
+            break;
     }
 }
 
@@ -319,6 +448,8 @@ static int
 run_worker(void *data) {
     struct sc_gui_app *app = data;
 
+    sc_tick next_poll = 0; // poll immediately
+
     sc_mutex_lock(&app->mutex);
     while (!app->stopped) {
         struct sc_gui_task *task = app->tasks;
@@ -326,22 +457,28 @@ run_worker(void *data) {
             app->tasks = task->next;
             task->next = NULL;
         }
+        bool refresh = app->refresh_requested;
         app->refresh_requested = false;
         sc_mutex_unlock(&app->mutex);
 
+        bool poll = refresh || sc_tick_now() >= next_poll;
         if (task) {
+            // Device tasks change the device list
+            poll |= !is_file_task(task->type);
             run_task(app, task);
             if (!sc_push_event_with_data(SC_EVENT_GUI_TASK_DONE, task)) {
                 sc_gui_task_destroy(task);
             }
         }
 
-        list_devices(app);
+        if (poll) {
+            list_devices(app);
+            next_poll = sc_tick_now() + SC_GUI_DEVICE_POLL_INTERVAL;
+        }
 
         sc_mutex_lock(&app->mutex);
         if (!app->stopped && !app->tasks && !app->refresh_requested) {
-            sc_tick deadline = sc_tick_now() + SC_GUI_DEVICE_POLL_INTERVAL;
-            sc_cond_timedwait(&app->cond, &app->mutex, deadline);
+            sc_cond_timedwait(&app->cond, &app->mutex, next_poll);
         }
     }
     sc_mutex_unlock(&app->mutex);
@@ -355,6 +492,40 @@ request_refresh(struct sc_gui_app *app) {
     app->refresh_requested = true;
     sc_cond_signal(&app->cond);
     sc_mutex_unlock(&app->mutex);
+}
+
+static void
+enqueue_task(struct sc_gui_app *app, struct sc_gui_task *task) {
+    sc_mutex_lock(&app->mutex);
+    struct sc_gui_task **tail = &app->tasks;
+    while (*tail) {
+        tail = &(*tail)->next;
+    }
+    *tail = task;
+    sc_cond_signal(&app->cond);
+    sc_mutex_unlock(&app->mutex);
+}
+
+static struct sc_gui_task *
+new_file_task(struct sc_gui_app *app, enum sc_gui_task_type type,
+              const char *path) {
+    if (!app->session_serial) {
+        return NULL;
+    }
+    struct sc_gui_task *task = calloc(1, sizeof(*task));
+    if (!task) {
+        LOG_OOM();
+        return NULL;
+    }
+    task->type = type;
+    task->serial = strdup(app->session_serial);
+    task->path = path ? strdup(path) : NULL;
+    if (!task->serial || (path && !task->path)) {
+        LOG_OOM();
+        sc_gui_task_destroy(task);
+        return NULL;
+    }
+    return task;
 }
 
 static void
@@ -385,6 +556,10 @@ submit_task(struct sc_gui_app *app, enum sc_gui_task_type type,
 // ---------------------------------------------------------------- transfers
 
 static void
+add_job(struct sc_gui_app *app, struct sc_gui_transfer_job *job,
+        const char *name);
+
+static void
 sc_gui_transfer_job_destroy(struct sc_gui_transfer_job *job) {
     free(job->serial);
     free(job->local);
@@ -403,6 +578,12 @@ run_transfer(struct sc_gui_app *app, struct sc_gui_transfer_job *job,
         ok = sc_adb_run_capture(&app->transfer_intr, args, out, sizeof(out));
         // Old adb versions return 0 on failure
         ok = ok && !strstr(out, "Failure");
+    } else if (job->type == SC_GUI_TRANSFER_PULL) {
+        // For a pull, local is the destination folder and remote_dir the
+        // file or folder on the device
+        const char *const args[] = {"-s", job->serial, "pull",
+                                    job->remote_dir, job->local, NULL};
+        ok = sc_adb_run_capture(&app->transfer_intr, args, out, sizeof(out));
     } else {
         const char *const args[] = {"-s", job->serial, "push", job->local,
                                     job->remote_dir, NULL};
@@ -418,6 +599,9 @@ run_transfer(struct sc_gui_app *app, struct sc_gui_transfer_job *job,
         u->state = SC_GUI_TRANSFER_DONE;
         if (job->type == SC_GUI_TRANSFER_INSTALL) {
             snprintf(u->detail, sizeof(u->detail), "Installed");
+        } else if (job->type == SC_GUI_TRANSFER_PULL) {
+            snprintf(u->detail, sizeof(u->detail), "Saved to %s",
+                     job->local);
         } else {
             snprintf(u->detail, sizeof(u->detail), "Copied to %s",
                      job->remote_dir);
@@ -532,9 +716,14 @@ enqueue_transfer(struct sc_gui_app *app, const char *local,
         return;
     }
 
-    sc_gui_update_transfer(app->gui, job->id, job->type,
-                           sc_gui_path_basename(local), SC_GUI_TRANSFER_PENDING,
-                           NULL);
+    add_job(app, job, sc_gui_path_basename(local));
+}
+
+static void
+add_job(struct sc_gui_app *app, struct sc_gui_transfer_job *job,
+        const char *name) {
+    sc_gui_update_transfer(app->gui, job->id, job->type, name,
+                           SC_GUI_TRANSFER_PENDING, NULL);
     ++app->active_transfers;
 
     sc_mutex_lock(&app->mutex);
@@ -545,6 +734,82 @@ enqueue_transfer(struct sc_gui_app *app, const char *local,
     *tail = job;
     sc_cond_signal(&app->transfer_cond);
     sc_mutex_unlock(&app->mutex);
+}
+
+// Download a file or folder from the device into local_dir
+static void
+enqueue_pull(struct sc_gui_app *app, const char *remote,
+             const char *local_dir) {
+    if (!app->session_serial) {
+        return;
+    }
+    struct sc_gui_transfer_job *job = calloc(1, sizeof(*job));
+    if (!job) {
+        LOG_OOM();
+        return;
+    }
+    job->id = ++app->next_transfer_id;
+    job->type = SC_GUI_TRANSFER_PULL;
+    job->serial = strdup(app->session_serial);
+    job->local = strdup(local_dir);
+    job->remote_dir = strdup(remote);
+    if (!job->serial || !job->local || !job->remote_dir) {
+        LOG_OOM();
+        sc_gui_transfer_job_destroy(job);
+        return;
+    }
+
+    // Name: last component, without the trailing '/'
+    char name[256];
+    snprintf(name, sizeof(name), "%s", remote);
+    size_t len = strlen(name);
+    while (len > 1 && name[len - 1] == '/') {
+        name[--len] = '\0';
+    }
+    add_job(app, job, sc_gui_path_basename(name));
+}
+
+static const char *
+get_downloads_folder(void) {
+    const char *dir = SDL_GetUserFolder(SDL_FOLDER_DOWNLOADS);
+    if (!dir) {
+        dir = SDL_GetUserFolder(SDL_FOLDER_HOME);
+    }
+    return dir ? dir : ".";
+}
+
+// Files to pull once the user chose a folder
+struct sc_gui_pull_request {
+    char **paths;
+    size_t count;
+    char *dir; // set by the dialog callback
+};
+
+static void
+sc_gui_pull_request_destroy(struct sc_gui_pull_request *req) {
+    for (size_t i = 0; i < req->count; ++i) {
+        free(req->paths[i]);
+    }
+    free(req->paths);
+    free(req->dir);
+    free(req);
+}
+
+// Called by SDL (possibly from another thread)
+static void SDLCALL
+on_folder_chosen(void *userdata, const char *const *filelist, int filter) {
+    (void) filter;
+    struct sc_gui_pull_request *req = userdata;
+    if (!filelist || !filelist[0]) {
+        // Canceled or error
+        sc_gui_pull_request_destroy(req);
+        return;
+    }
+    req->dir = strdup(filelist[0]);
+    if (!req->dir
+            || !sc_push_event_with_data(SC_EVENT_GUI_FOLDER_CHOSEN, req)) {
+        sc_gui_pull_request_destroy(req);
+    }
 }
 
 static void
@@ -560,6 +825,7 @@ on_transfer_update(struct sc_gui_app *app, struct sc_gui_transfer_update *u) {
             if (u->type == SC_GUI_TRANSFER_INSTALL) {
                 ++app->batch_installed;
             } else {
+                // copies and downloads
                 ++app->batch_copied;
             }
         } else if (u->state == SC_GUI_TRANSFER_FAILED) {
@@ -581,14 +847,14 @@ on_transfer_update(struct sc_gui_app *app, struct sc_gui_transfer_update *u) {
             sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR, msg);
         } else if (app->batch_installed || app->batch_copied) {
             if (app->batch_installed && app->batch_copied) {
-                snprintf(msg, sizeof(msg), "Installed %u app(s) and copied "
-                         "%u file(s).", app->batch_installed,
+                snprintf(msg, sizeof(msg), "Installed %u app(s) and "
+                         "transferred %u file(s).", app->batch_installed,
                          app->batch_copied);
             } else if (app->batch_installed) {
                 snprintf(msg, sizeof(msg), "Installed %u app(s).",
                          app->batch_installed);
             } else {
-                snprintf(msg, sizeof(msg), "Copied %u file(s).",
+                snprintf(msg, sizeof(msg), "Transferred %u file(s).",
                          app->batch_copied);
             }
             sc_gui_show_toast(app->gui, SC_GUI_TOAST_SUCCESS, msg);
@@ -834,7 +1100,60 @@ on_devices(struct sc_gui_app *app, struct sc_vec_adb_devices *vec) {
 }
 
 static void
+on_file_task_done(struct sc_gui_app *app, struct sc_gui_task *task) {
+    switch (task->type) {
+        case SC_GUI_TASK_LIST_DIR: {
+            struct sc_gui_listing *l = &task->listing;
+            struct sc_gui_file *files =
+                l->count ? calloc(l->count, sizeof(*files)) : NULL;
+            if (l->count && !files) {
+                LOG_OOM();
+                break;
+            }
+            for (size_t i = 0; i < l->count; ++i) {
+                const struct sc_gui_file_entry *e = &l->entries[i];
+                files[i].name = e->name;
+                files[i].mtime = e->mtime;
+                files[i].size = e->size;
+                files[i].type = e->type == 'd' ? SC_GUI_FILE_DIRECTORY
+                              : e->type == 'l' ? SC_GUI_FILE_LINK
+                              : e->type == '-' ? SC_GUI_FILE_REGULAR
+                              : SC_GUI_FILE_OTHER;
+            }
+            const char *error = l->error;
+            if (!task->success && !error) {
+                error = "Could not list the folder.";
+            }
+            sc_gui_set_listing(app->gui, task->path, files, l->count, error);
+            free(files);
+            break;
+        }
+        case SC_GUI_TASK_DELETE:
+        case SC_GUI_TASK_MKDIR:
+            if (!task->success) {
+                char msg[320];
+                snprintf(msg, sizeof(msg), "%s: %s",
+                         task->type == SC_GUI_TASK_DELETE
+                             ? "Could not delete"
+                             : "Could not create the folder",
+                         task->error_buf[0] ? task->error_buf : "error");
+                sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR, msg);
+            }
+            sc_gui_files_changed(app->gui);
+            break;
+        default:
+            assert(!"unexpected task");
+    }
+    sc_gui_task_destroy(task);
+}
+
+static void
 on_task_done(struct sc_gui_app *app, struct sc_gui_task *task) {
+    if (is_file_task(task->type)) {
+        on_file_task_done(app, task);
+        return;
+    }
+
     sc_gui_set_task_busy(app->gui, false);
 
     char msg[256];
@@ -872,6 +1191,8 @@ on_task_done(struct sc_gui_app *app, struct sc_gui_task *task) {
                 sc_gui_show_toast(app->gui, SC_GUI_TOAST_INFO, msg);
             }
             break;
+        default:
+            break;
     }
 
     if (!task->success) {
@@ -896,6 +1217,14 @@ handle_app_event(struct sc_gui_app *app, const SDL_Event *event) {
         case SC_EVENT_GUI_TRANSFER:
             on_transfer_update(app, event->user.data1);
             return true;
+        case SC_EVENT_GUI_FOLDER_CHOSEN: {
+            struct sc_gui_pull_request *req = event->user.data1;
+            for (size_t i = 0; i < req->count; ++i) {
+                enqueue_pull(app, req->paths[i], req->dir);
+            }
+            sc_gui_pull_request_destroy(req);
+            return true;
+        }
         default:
             return false;
     }
@@ -1014,6 +1343,87 @@ static void
 cb_on_cancel_transfer(uint32_t id, void *userdata) {
     struct sc_gui_app *app = userdata;
     cancel_transfer(app, id);
+}
+
+static void
+cb_on_list_dir(const char *path, void *userdata) {
+    struct sc_gui_app *app = userdata;
+    struct sc_gui_task *task = new_file_task(app, SC_GUI_TASK_LIST_DIR, path);
+    if (task) {
+        enqueue_task(app, task);
+    } else {
+        sc_gui_set_listing(app->gui, path, NULL, 0, "No device");
+    }
+}
+
+static void
+cb_on_create_dir(const char *path, void *userdata) {
+    struct sc_gui_app *app = userdata;
+    struct sc_gui_task *task = new_file_task(app, SC_GUI_TASK_MKDIR, path);
+    if (task) {
+        enqueue_task(app, task);
+    }
+}
+
+static void
+cb_on_delete_files(const char *const *paths, size_t count, void *userdata) {
+    struct sc_gui_app *app = userdata;
+    struct sc_gui_task *task = new_file_task(app, SC_GUI_TASK_DELETE, NULL);
+    if (!task) {
+        return;
+    }
+    task->paths = calloc(count, sizeof(*task->paths));
+    if (!task->paths) {
+        LOG_OOM();
+        sc_gui_task_destroy(task);
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        task->paths[i] = strdup(paths[i]);
+        if (!task->paths[i]) {
+            LOG_OOM();
+            sc_gui_task_destroy(task);
+            return;
+        }
+        task->path_count = i + 1;
+    }
+    enqueue_task(app, task);
+}
+
+static void
+cb_on_pull_files(const char *const *paths, size_t count, bool choose_folder,
+                 void *userdata) {
+    struct sc_gui_app *app = userdata;
+    if (!choose_folder) {
+        const char *dir = get_downloads_folder();
+        for (size_t i = 0; i < count; ++i) {
+            enqueue_pull(app, paths[i], dir);
+        }
+        return;
+    }
+
+    struct sc_gui_pull_request *req = calloc(1, sizeof(*req));
+    if (!req) {
+        LOG_OOM();
+        return;
+    }
+    req->paths = calloc(count, sizeof(*req->paths));
+    if (!req->paths) {
+        LOG_OOM();
+        free(req);
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        req->paths[i] = strdup(paths[i]);
+        if (!req->paths[i]) {
+            LOG_OOM();
+            sc_gui_pull_request_destroy(req);
+            return;
+        }
+        req->count = i + 1;
+    }
+    SDL_ShowOpenFolderDialog(on_folder_chosen, req, app->window,
+                             get_downloads_folder(), false);
 }
 
 static void
@@ -1239,6 +1649,9 @@ drain_app_events(void) {
     while (sc_dequeue_event(SC_EVENT_GUI_TRANSFER, &event)) {
         free(event.user.data1);
     }
+    while (sc_dequeue_event(SC_EVENT_GUI_FOLDER_CHOSEN, &event)) {
+        sc_gui_pull_request_destroy(event.user.data1);
+    }
 }
 
 enum scrcpy_exit_code
@@ -1301,6 +1714,10 @@ scrcpy_gui(struct scrcpy_options *options) {
         .on_prefs_changed = cb_on_prefs_changed,
         .on_drop_files = cb_on_drop_files,
         .on_cancel_transfer = cb_on_cancel_transfer,
+        .on_list_dir = cb_on_list_dir,
+        .on_delete_files = cb_on_delete_files,
+        .on_create_dir = cb_on_create_dir,
+        .on_pull_files = cb_on_pull_files,
     };
     struct sc_gui_params gui_params = {
         .window = app->window,

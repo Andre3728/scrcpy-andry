@@ -114,6 +114,16 @@ light_palette() {
     return p;
 }
 
+std::string
+sc_gui_path_name(const std::string &path) {
+    std::string p = path;
+    while (p.size() > 1 && p.back() == '/') {
+        p.pop_back();
+    }
+    size_t pos = p.find_last_of('/');
+    return pos == std::string::npos ? p : p.substr(pos + 1);
+}
+
 ImVec2
 operator+(ImVec2 a, ImVec2 b) {
     return ImVec2(a.x + b.x, a.y + b.y);
@@ -151,6 +161,18 @@ struct Device {
     bool ready() const { return state == "device"; }
 };
 
+struct FileItem {
+    std::string name;
+    std::string mtime;
+    uint64_t size;
+    sc_gui_file_type type;
+
+    // Symlinks are opened as directories (most links on Android are)
+    bool is_dir() const {
+        return type == SC_GUI_FILE_DIRECTORY || type == SC_GUI_FILE_LINK;
+    }
+};
+
 struct Transfer {
     uint32_t id;
     sc_gui_transfer_type type;
@@ -184,7 +206,8 @@ struct sc_gui {
 
     float ui_scale = 0; // 0 means "not computed yet"
     bool dark = true;
-    sc_gui_prefs prefs = {SC_GUI_APPEARANCE_SYSTEM, true, ""};
+    sc_gui_prefs prefs = {SC_GUI_APPEARANCE_SYSTEM, true, SC_GUI_PAGE_DEVICES,
+                          ""};
     char adb_path_edit[512] = "";
 
     // Settings: the profile currently applied, and the one being edited
@@ -226,6 +249,23 @@ struct sc_gui {
 
     std::vector<Transfer> transfers; // oldest first
     bool open_transfers = false;
+
+    // File manager
+    std::string files_path = "/sdcard/";
+    std::vector<std::string> files_back;
+    std::vector<std::string> files_forward;
+    std::vector<FileItem> files;
+    std::string files_error;
+    bool files_loading = false;
+    bool files_need_list = true;
+    std::vector<std::string> files_selected; // names
+    int files_sort = 0; // 0: name, 1: date, 2: size
+    std::string files_context; // name of the item of the context menu
+    bool open_file_context = false;
+    std::vector<std::string> delete_paths;
+    bool open_delete_confirm = false;
+    bool open_new_folder = false;
+    char new_folder_name[128] = "";
 
     bool mirror_focused = false;
     // A mouse button was pressed on the mirror: forward all mouse events to
@@ -886,8 +926,11 @@ draw_nav(sc_gui *gui, float height) {
     };
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, gui->s(2)));
     for (const auto &item : items) {
-        if (nav_item(gui, item.icon, item.label, gui->page == item.page)) {
+        if (nav_item(gui, item.icon, item.label, gui->page == item.page)
+                && gui->page != item.page) {
             gui->page = item.page;
+            gui->prefs.page = (sc_gui_page) item.page;
+            notify_prefs_changed(gui);
         }
     }
     ImGui::PopStyleVar();
@@ -1098,16 +1141,626 @@ draw_page_devices(sc_gui *gui) {
     draw_wifi_card(gui);
 }
 
+std::string
+path_join(const std::string &dir, const std::string &name) {
+    std::string r = dir;
+    if (r.empty() || r.back() != '/') {
+        r += '/';
+    }
+    return r + name;
+}
+
+std::string
+path_parent(const std::string &path) {
+    // "/sdcard/DCIM/" -> "/sdcard/"
+    std::string p = path;
+    while (p.size() > 1 && p.back() == '/') {
+        p.pop_back();
+    }
+    size_t pos = p.find_last_of('/');
+    if (pos == std::string::npos || pos == 0) {
+        return "/";
+    }
+    return p.substr(0, pos + 1);
+}
+
+std::string
+human_size(uint64_t size) {
+    static const char *const units[] = {"bytes", "KB", "MB", "GB", "TB"};
+    double v = (double) size;
+    int u = 0;
+    while (v >= 1000 && u < 4) {
+        v /= 1000;
+        ++u;
+    }
+    char buf[32];
+    if (u == 0) {
+        snprintf(buf, sizeof(buf), "%u %s", (unsigned) size, units[0]);
+    } else {
+        snprintf(buf, sizeof(buf), v < 10 ? "%.1f %s" : "%.0f %s", v,
+                 units[u]);
+    }
+    return buf;
+}
+
+void
+files_navigate(sc_gui *gui, std::string path, bool history = true) {
+    if (path.empty() || path.back() != '/') {
+        path += '/';
+    }
+    if (path == gui->files_path) {
+        return;
+    }
+    if (history) {
+        gui->files_back.push_back(gui->files_path);
+        gui->files_forward.clear();
+    }
+    gui->files_path = path;
+    gui->files_need_list = true;
+    gui->files.clear();
+    gui->files_error.clear();
+    gui->files_selected.clear();
+}
+
+void
+files_reset(sc_gui *gui) {
+    gui->files_path = "/sdcard/";
+    gui->files_back.clear();
+    gui->files_forward.clear();
+    gui->files.clear();
+    gui->files_error.clear();
+    gui->files_selected.clear();
+    gui->files_need_list = true;
+    gui->files_loading = false;
+}
+
+void
+files_sort(sc_gui *gui) {
+    int mode = gui->files_sort;
+    std::stable_sort(gui->files.begin(), gui->files.end(),
+                     [mode](const FileItem &a, const FileItem &b) {
+        if (a.is_dir() != b.is_dir()) {
+            return a.is_dir(); // folders first
+        }
+        if (mode == 1 && a.mtime != b.mtime) {
+            return a.mtime > b.mtime; // newest first
+        }
+        if (mode == 2 && a.size != b.size) {
+            return a.size > b.size; // largest first
+        }
+        return SDL_strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+}
+
+bool
+files_is_selected(sc_gui *gui, const std::string &name) {
+    return std::find(gui->files_selected.begin(), gui->files_selected.end(),
+                     name) != gui->files_selected.end();
+}
+
+void
+files_pull(sc_gui *gui, const std::vector<std::string> &names,
+           bool choose_folder) {
+    std::vector<std::string> paths;
+    for (const std::string &name : names) {
+        paths.push_back(path_join(gui->files_path, name));
+    }
+    gui->open_transfers = !choose_folder;
+    defer(gui, [gui, paths, choose_folder] {
+        if (!gui->cbs || !gui->cbs->on_pull_files) {
+            return;
+        }
+        std::vector<const char *> list;
+        for (const std::string &p : paths) {
+            list.push_back(p.c_str());
+        }
+        gui->cbs->on_pull_files(list.data(), list.size(), choose_folder,
+                                gui->cbs_userdata);
+    });
+}
+
+void
+files_ask_delete(sc_gui *gui, const std::vector<std::string> &names) {
+    gui->delete_paths.clear();
+    for (const std::string &name : names) {
+        gui->delete_paths.push_back(path_join(gui->files_path, name));
+    }
+    gui->open_delete_confirm = !gui->delete_paths.empty();
+}
+
+// Small icon button for the file manager toolbar
+bool
+icon_button(sc_gui *gui, const char *id, const char *icon,
+            const char *tooltip) {
+    ImGui::PushID(id);
+    ImGui::PushStyleColor(ImGuiCol_Button, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                        ImVec2(gui->s(6), gui->s(4)));
+    bool clicked = ImGui::Button(icon);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    if (tooltip) {
+        ImGui::SetItemTooltip("%s", tooltip);
+    }
+    ImGui::PopID();
+    return clicked;
+}
+
+void
+draw_breadcrumb(sc_gui *gui) {
+    // "/sdcard/DCIM/Camera/" -> Internal storage > DCIM > Camera
+    std::string path = gui->files_path;
+    std::vector<std::pair<std::string, std::string>> parts; // label, path
+    std::string prefix;
+    size_t pos = 0;
+    if (path.compare(0, 8, "/sdcard/") == 0) {
+        parts.push_back({"Internal storage", "/sdcard/"});
+        pos = 8;
+        prefix = "/sdcard/";
+    } else {
+        parts.push_back({"/", "/"});
+        pos = 1;
+        prefix = "/";
+    }
+    while (pos < path.size()) {
+        size_t next = path.find('/', pos);
+        if (next == std::string::npos) {
+            next = path.size();
+        }
+        std::string name = path.substr(pos, next - pos);
+        if (!name.empty()) {
+            prefix += name + "/";
+            parts.push_back({name, prefix});
+        }
+        pos = next + 1;
+    }
+
+    float avail = ImGui::GetContentRegionAvail().x;
+    float x = 0;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        bool last = i + 1 == parts.size();
+        const char *label = parts[i].first.c_str();
+        float w = ImGui::CalcTextSize(label).x;
+        if (i) {
+            float sep_w = ImGui::CalcTextSize(">").x + gui->s(8);
+            if (x + sep_w + w > avail) {
+                x = 0; // wrap
+            } else {
+                ImGui::SameLine(0, gui->s(4));
+                x += sep_w;
+            }
+            if (x) {
+                text_colored(gui->pal.text_secondary, ">");
+                ImGui::SameLine(0, gui->s(4));
+            }
+        }
+        ImGui::PushID((int) i);
+        if (last) {
+            text_semibold(gui, label);
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, gui->pal.accent);
+            ImGui::TextUnformatted(label);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            }
+            if (ImGui::IsItemClicked()) {
+                files_navigate(gui, parts[i].second);
+            }
+        }
+        ImGui::PopID();
+        x += w;
+    }
+}
+
+void
+draw_file_row(sc_gui *gui, const FileItem &f, float width, ImVec2 list_min,
+              ImVec2 list_max) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    float h = gui->s(40);
+
+    ImGui::PushID(f.name.c_str());
+    ImGui::InvisibleButton("##row", ImVec2(width, h));
+    bool hovered = ImGui::IsItemHovered();
+    bool selected = files_is_selected(gui, f.name);
+
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        if (ImGui::GetIO().KeyCtrl) {
+            if (selected) {
+                gui->files_selected.erase(
+                    std::find(gui->files_selected.begin(),
+                              gui->files_selected.end(), f.name));
+            } else {
+                gui->files_selected.push_back(f.name);
+            }
+        } else {
+            gui->files_selected = {f.name};
+        }
+    }
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        if (f.is_dir()) {
+            files_navigate(gui, path_join(gui->files_path, f.name));
+        } else {
+            files_pull(gui, {f.name}, false);
+        }
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+        if (!selected) {
+            gui->files_selected = {f.name};
+        }
+        gui->files_context = f.name;
+        gui->open_file_context = true;
+    }
+
+    // Drop into this folder
+    bool drop_here = false;
+    if (gui->drag_active && f.is_dir()) {
+        ImVec2 d = gui->drag_pos;
+        if (d.x >= pos.x && d.x < pos.x + width && d.y >= pos.y
+                && d.y < pos.y + h && d.y >= list_min.y
+                && d.y < list_max.y) {
+            drop_here = true;
+            gui->drop_target_dir = path_join(gui->files_path, f.name) + "/";
+        }
+    }
+
+    if (drop_here) {
+        dl->AddRectFilled(pos, pos + ImVec2(width, h),
+                          (gui->pal.accent & 0x00FFFFFF) | 0x40000000,
+                          gui->s(6));
+        dl->AddRect(pos, pos + ImVec2(width, h), gui->pal.accent, gui->s(6),
+                    0, gui->s(1.5f));
+    } else if (selected) {
+        dl->AddRectFilled(pos, pos + ImVec2(width, h), gui->pal.accent,
+                          gui->s(6));
+    } else if (hovered) {
+        dl->AddRectFilled(pos, pos + ImVec2(width, h), gui->pal.hover,
+                          gui->s(6));
+    }
+
+    ImU32 text = selected && !drop_here ? gui->pal.accent_text : gui->pal.text;
+    ImU32 secondary = selected && !drop_here ? (gui->pal.accent_text
+                                                & 0xC0FFFFFF)
+                                             : gui->pal.text_secondary;
+    ImU32 icon_color = selected && !drop_here
+                     ? gui->pal.accent_text
+                     : f.is_dir() ? gui->pal.accent : gui->pal.text_secondary;
+
+    ImGui::PushFont(nullptr, 20.f);
+    const char *icon = f.type == SC_GUI_FILE_DIRECTORY ? SC_ICON_FOLDER
+                     : f.type == SC_GUI_FILE_LINK ? SC_ICON_LINK
+                     : SC_ICON_FILE;
+    ImVec2 is = ImGui::CalcTextSize(icon);
+    dl->AddText(ImVec2(pos.x + gui->s(8), pos.y + (h - is.y) / 2 - gui->s(2)),
+                icon_color, icon);
+    ImGui::PopFont();
+
+    float tx = pos.x + gui->s(38);
+    ImVec4 clip(tx, pos.y, pos.x + width - gui->s(6), pos.y + h);
+    float fs = ImGui::GetFontSize();
+    dl->AddText(nullptr, 0, ImVec2(tx, pos.y + gui->s(4)), text,
+                f.name.c_str(), nullptr, 0, &clip);
+    std::string sub = f.type == SC_GUI_FILE_DIRECTORY ? "Folder"
+                    : f.type == SC_GUI_FILE_LINK ? "Link"
+                    : human_size(f.size);
+    if (!f.mtime.empty()) {
+        sub += "  \xC2\xB7  " + f.mtime;
+    }
+    ImGui::PushFont(nullptr, 12.f);
+    dl->AddText(nullptr, 0, ImVec2(tx, pos.y + gui->s(6) + fs), secondary,
+                sub.c_str(), nullptr, 0, &clip);
+    ImGui::PopFont();
+
+    ImGui::PopID();
+}
+
+void
+draw_file_dialogs(sc_gui *gui) {
+    // Context menu (requested by a row, opened outside the row ID scope)
+    if (gui->open_file_context) {
+        ImGui::OpenPopup("##file_context");
+        gui->open_file_context = false;
+    }
+    if (ImGui::BeginPopup("##file_context")) {
+        const FileItem *item = nullptr;
+        for (const FileItem &f : gui->files) {
+            if (f.name == gui->files_context) {
+                item = &f;
+            }
+        }
+        if (item && item->is_dir() && gui->files_selected.size() <= 1
+                && ImGui::Selectable(SC_ICON_FOLDER "   Open")) {
+            files_navigate(gui, path_join(gui->files_path, item->name));
+        }
+        if (ImGui::Selectable(SC_ICON_ARROW_DOWN_TO_LINE "   Download")) {
+            files_pull(gui, gui->files_selected, false);
+        }
+        if (ImGui::Selectable(SC_ICON_FOLDER "   Save to...")) {
+            files_pull(gui, gui->files_selected, true);
+        }
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Text, gui->pal.error);
+        if (ImGui::Selectable(SC_ICON_TRASH "   Delete")) {
+            files_ask_delete(gui, gui->files_selected);
+        }
+        ImGui::PopStyleColor();
+        ImGui::EndPopup();
+    }
+}
+
+void
+draw_file_modals(sc_gui *gui) {
+    if (gui->open_delete_confirm) {
+        ImGui::OpenPopup("Delete");
+        gui->open_delete_confirm = false;
+    }
+    if (gui->open_new_folder) {
+        ImGui::OpenPopup("New folder");
+        gui->open_new_folder = false;
+        gui->new_folder_name[0] = '\0';
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(gui->s(320), 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(gui->s(18), gui->s(16)));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, gui->s(12));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, gui->pal.card_bg);
+    if (ImGui::BeginPopupModal("Delete", nullptr,
+                               ImGuiWindowFlags_NoTitleBar
+                                   | ImGuiWindowFlags_AlwaysAutoResize)) {
+        size_t n = gui->delete_paths.size();
+        char title[96];
+        if (n == 1) {
+            snprintf(title, sizeof(title), "Delete \"%s\"?",
+                     sc_gui_path_name(gui->delete_paths[0]).c_str());
+        } else {
+            snprintf(title, sizeof(title), "Delete %u items?", (unsigned) n);
+        }
+        ImGui::PushTextWrapPos(gui->s(284));
+        text_semibold(gui, title);
+        text_wrapped_colored(gui->pal.text_secondary,
+                             "The files are deleted from the device. This "
+                             "cannot be undone.");
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, gui->s(4)));
+        if (push_button(gui, "Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, gui->pal.error);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              gui->pal.error & 0xE6FFFFFF);
+        ImGui::PushStyleColor(ImGuiCol_Text, rgba(0xFFFFFF));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(gui->s(12), gui->s(5)));
+        if (ImGui::Button("Delete")) {
+            std::vector<std::string> paths = gui->delete_paths;
+            defer(gui, [gui, paths] {
+                if (!gui->cbs || !gui->cbs->on_delete_files) {
+                    return;
+                }
+                std::vector<const char *> list;
+                for (const std::string &p : paths) {
+                    list.push_back(p.c_str());
+                }
+                gui->cbs->on_delete_files(list.data(), list.size(),
+                                          gui->cbs_userdata);
+            });
+            gui->files_selected.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
+        ImGui::EndPopup();
+    }
+
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(gui->s(320), 0));
+    if (ImGui::BeginPopupModal("New folder", nullptr,
+                               ImGuiWindowFlags_NoTitleBar
+                                   | ImGuiWindowFlags_AlwaysAutoResize)) {
+        text_semibold(gui, "New folder");
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        input_text(gui, "##folder_name", "Folder name", gui->new_folder_name,
+                   sizeof(gui->new_folder_name));
+        bool enter = ImGui::IsItemDeactivatedAfterEdit()
+                  && ImGui::IsKeyPressed(ImGuiKey_Enter);
+        bool valid = *gui->new_folder_name
+                  && !strchr(gui->new_folder_name, '/');
+        ImGui::Dummy(ImVec2(0, gui->s(4)));
+        if (push_button(gui, "Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!valid);
+        if ((push_button(gui, "Create", true) || enter) && valid) {
+            std::string path = path_join(gui->files_path,
+                                         gui->new_folder_name);
+            defer(gui, [gui, path] {
+                if (gui->cbs && gui->cbs->on_create_dir) {
+                    gui->cbs->on_create_dir(path.c_str(), gui->cbs_userdata);
+                }
+            });
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
 void
 draw_page_files(sc_gui *gui) {
     page_title(gui, "Files");
-    info_card(gui, "##files", SC_ICON_UPLOAD, "Copy files to the device",
-              "Drag files onto the device screen to copy them to "
-              "/sdcard/Download.");
-    ImGui::Dummy(ImVec2(0, gui->s(4)));
-    text_wrapped_colored(gui->pal.text_secondary,
-                         "A file browser with folders, downloads and transfer "
-                         "progress is coming in a future update.");
+
+    if (!is_mirroring(gui)) {
+        info_card(gui, "##files_none", SC_ICON_FOLDER, "No device",
+                  "Mirror a device to browse its files.");
+        return;
+    }
+
+    // Request the listing when needed
+    if (gui->files_need_list && !gui->files_loading) {
+        gui->files_need_list = false;
+        gui->files_loading = true;
+        std::string path = gui->files_path;
+        defer(gui, [gui, path] {
+            if (gui->cbs && gui->cbs->on_list_dir) {
+                gui->cbs->on_list_dir(path.c_str(), gui->cbs_userdata);
+            }
+        });
+    }
+
+    // Toolbar
+    ImGui::BeginDisabled(gui->files_back.empty());
+    if (icon_button(gui, "back", SC_ICON_CHEVRON_LEFT, "Back")) {
+        gui->files_forward.push_back(gui->files_path);
+        std::string path = gui->files_back.back();
+        gui->files_back.pop_back();
+        files_navigate(gui, path, false);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, gui->s(2));
+    ImGui::BeginDisabled(gui->files_forward.empty());
+    if (icon_button(gui, "forward", SC_ICON_CHEVRON_RIGHT, "Forward")) {
+        gui->files_back.push_back(gui->files_path);
+        std::string path = gui->files_forward.back();
+        gui->files_forward.pop_back();
+        files_navigate(gui, path, false);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, gui->s(2));
+    ImGui::BeginDisabled(gui->files_path == "/");
+    if (icon_button(gui, "up", SC_ICON_ARROW_UP, "Enclosing folder")) {
+        files_navigate(gui, path_parent(gui->files_path));
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, gui->s(2));
+    if (icon_button(gui, "refresh", SC_ICON_ROTATE_CW, "Refresh")) {
+        gui->files_need_list = true;
+    }
+    ImGui::SameLine(0, gui->s(2));
+    if (icon_button(gui, "mkdir", SC_ICON_FOLDER_PLUS, "New folder")) {
+        gui->open_new_folder = true;
+    }
+    ImGui::SameLine(0, gui->s(2));
+    if (icon_button(gui, "places", SC_ICON_MAP_PIN, "Locations")) {
+        ImGui::OpenPopup("##places");
+    }
+    if (ImGui::BeginPopup("##places")) {
+        static const char *const places[][2] = {
+            {"Internal storage", "/sdcard/"},
+            {"DCIM", "/sdcard/DCIM/"},
+            {"Download", "/sdcard/Download/"},
+            {"Documents", "/sdcard/Documents/"},
+            {"Pictures", "/sdcard/Pictures/"},
+            {"Movies", "/sdcard/Movies/"},
+            {"Music", "/sdcard/Music/"},
+            {"Root (/)", "/"},
+        };
+        for (const auto &place : places) {
+            std::string label = std::string(SC_ICON_FOLDER "   ") + place[0];
+            if (ImGui::Selectable(label.c_str(),
+                                  gui->files_path == place[1])) {
+                files_navigate(gui, place[1]);
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    draw_breadcrumb(gui);
+
+    static const char *const sorts[] = {"Name", "Date", "Size"};
+    if (segmented(gui, "sort", sorts, 3, &gui->files_sort)) {
+        files_sort(gui);
+    }
+
+    // List
+    bool has_selection = !gui->files_selected.empty();
+    float footer = has_selection ? gui->s(40) : 0;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, gui->pal.card_bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(gui->s(6), gui->s(6)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, gui->s(2)));
+    ImGui::BeginChild("##files_list", ImVec2(0, -footer),
+                      ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImVec2 list_min = ImGui::GetWindowPos();
+    ImVec2 list_max = list_min + ImGui::GetWindowSize();
+
+    if (gui->files_loading && gui->files.empty()) {
+        spinner(gui, 9, gui->pal.text_secondary);
+        ImGui::SameLine();
+        text_colored(gui->pal.text_secondary, "Loading...");
+    } else if (!gui->files_error.empty()) {
+        text_colored(gui->pal.warning, SC_ICON_TRIANGLE_ALERT);
+        ImGui::SameLine();
+        text_wrapped_colored(gui->pal.text_secondary,
+                             gui->files_error.c_str());
+    } else if (gui->files.empty()) {
+        text_colored(gui->pal.text_secondary, "This folder is empty.");
+    } else {
+        float width = ImGui::GetContentRegionAvail().x;
+        // The names are copied: a row action may modify the list
+        for (const FileItem &f : std::vector<FileItem>(gui->files)) {
+            draw_file_row(gui, f, width, list_min, list_max);
+        }
+    }
+
+    // Click on the empty area: clear the selection
+    if (ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered()
+            && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        gui->files_selected.clear();
+    }
+
+    draw_file_dialogs(gui);
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+
+    // Drop into the current folder
+    if (gui->drag_active) {
+        ImVec2 d = gui->drag_pos;
+        if (d.x >= list_min.x && d.x < list_max.x && d.y >= list_min.y
+                && d.y < list_max.y) {
+            if (gui->drop_target_dir.empty()) {
+                gui->drop_target_dir = gui->files_path;
+            }
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            dl->AddRect(list_min, list_max, gui->pal.accent, gui->s(10), 0,
+                        gui->s(2));
+        }
+    }
+
+    if (has_selection) {
+        char count[32];
+        snprintf(count, sizeof(count), "%u selected",
+                 (unsigned) gui->files_selected.size());
+        ImGui::AlignTextToFramePadding();
+        text_colored(gui->pal.text_secondary, count);
+        ImGui::SameLine();
+        if (icon_button(gui, "dl", SC_ICON_ARROW_DOWN_TO_LINE,
+                        "Download to the Downloads folder")) {
+            files_pull(gui, gui->files_selected, false);
+        }
+        ImGui::SameLine(0, gui->s(2));
+        if (icon_button(gui, "saveto", SC_ICON_FOLDER, "Save to...")) {
+            files_pull(gui, gui->files_selected, true);
+        }
+        ImGui::SameLine(0, gui->s(2));
+        ImGui::PushStyleColor(ImGuiCol_Text, gui->pal.error);
+        if (icon_button(gui, "del", SC_ICON_TRASH, "Delete")) {
+            files_ask_delete(gui, gui->files_selected);
+        }
+        ImGui::PopStyleColor();
+    }
+
+    draw_file_modals(gui);
 }
 
 void
@@ -1406,7 +2059,8 @@ transfer_state_text(const Transfer &t) {
             return "Waiting...";
         case SC_GUI_TRANSFER_RUNNING:
             return t.type == SC_GUI_TRANSFER_INSTALL ? "Installing..."
-                                                     : "Copying...";
+                 : t.type == SC_GUI_TRANSFER_PULL ? "Downloading..."
+                 : "Copying...";
         case SC_GUI_TRANSFER_CANCELED:
             return "Canceled";
         default:
@@ -1462,7 +2116,9 @@ draw_transfers_popup(sc_gui *gui, float anchor_x, float toolbar_y) {
         ImGui::PushID((int) t.id);
 
         const char *icon = t.type == SC_GUI_TRANSFER_INSTALL
-                         ? SC_ICON_PACKAGE : SC_ICON_FOLDER;
+                         ? SC_ICON_PACKAGE
+                         : t.type == SC_GUI_TRANSFER_PULL
+                         ? SC_ICON_ARROW_DOWN_TO_LINE : SC_ICON_UPLOAD;
         ImU32 color = gui->pal.accent;
         if (t.state == SC_GUI_TRANSFER_DONE) {
             color = gui->pal.success;
@@ -1516,7 +2172,8 @@ draw_transfers_popup(sc_gui *gui, float anchor_x, float toolbar_y) {
 // Feedback while files are dragged over the window
 void
 draw_drop_overlay(sc_gui *gui, float left, float width, float height) {
-    if (!gui->drag_active) {
+    if (!gui->drag_active || !gui->drop_target_dir.empty()) {
+        // No drag, or the file manager shows the drop target itself
         return;
     }
 
@@ -2150,6 +2807,7 @@ sc_gui_render(struct sc_gui *gui, const SDL_FRect *mirror_rect) {
     ImGui::NewFrame();
 
     ImVec2 display = ImGui::GetIO().DisplaySize;
+    gui->drop_target_dir.clear();
     if (!is_fullscreen(gui)) {
         sc_gui_insets insets = sc_gui_get_insets(gui);
         if (gui->sidebar_visible) {
@@ -2199,8 +2857,12 @@ sc_gui_set_devices(struct sc_gui *gui, const struct sc_gui_device *devices,
 void
 sc_gui_set_session(struct sc_gui *gui, enum sc_gui_session_state state,
                    const char *serial, const char *device_name, bool control) {
+    std::string new_serial = serial ? serial : "";
+    if (new_serial != gui->session_serial || state == SC_GUI_SESSION_NONE) {
+        files_reset(gui);
+    }
     gui->session = state;
-    gui->session_serial = serial ? serial : "";
+    gui->session_serial = new_serial;
     gui->session_name = device_name ? device_name
                       : serial ? serial : "";
     gui->control = control;
@@ -2234,6 +2896,7 @@ sc_gui_set_prefs(struct sc_gui *gui, const struct sc_gui_prefs *prefs) {
     gui->prefs = *prefs;
     memcpy(gui->adb_path_edit, prefs->adb_path, sizeof(gui->adb_path_edit));
     gui->sidebar_visible = prefs->sidebar_visible;
+    gui->page = (Page) prefs->page;
     update_theme(gui);
     if (sidebar_changed) {
         notify_insets_changed(gui);
@@ -2245,6 +2908,9 @@ void
 sc_gui_update_transfer(struct sc_gui *gui, uint32_t id,
                        enum sc_gui_transfer_type type, const char *name,
                        enum sc_gui_transfer_state state, const char *detail) {
+    if (type == SC_GUI_TRANSFER_PUSH && state == SC_GUI_TRANSFER_DONE) {
+        gui->files_need_list = true;
+    }
     for (Transfer &t : gui->transfers) {
         if (t.id == id) {
             t.state = state;
@@ -2267,6 +2933,42 @@ sc_gui_update_transfer(struct sc_gui *gui, uint32_t id,
             }
         }
     }
+    request_redraw(gui);
+}
+
+void
+sc_gui_set_listing(struct sc_gui *gui, const char *path,
+                   const struct sc_gui_file *files, size_t count,
+                   const char *error) {
+    gui->files_loading = false;
+    if (gui->files_path != path) {
+        // Obsolete (the user navigated meanwhile)
+        return;
+    }
+    gui->files.clear();
+    for (size_t i = 0; i < count; ++i) {
+        gui->files.push_back({files[i].name, files[i].mtime ? files[i].mtime
+                                                            : "",
+                              files[i].size, files[i].type});
+    }
+    gui->files_error = error ? error : "";
+    // Keep the selection of the files which still exist
+    std::vector<std::string> selected;
+    for (const std::string &name : gui->files_selected) {
+        for (const FileItem &f : gui->files) {
+            if (f.name == name) {
+                selected.push_back(name);
+            }
+        }
+    }
+    gui->files_selected.swap(selected);
+    files_sort(gui);
+    request_redraw(gui);
+}
+
+void
+sc_gui_files_changed(struct sc_gui *gui) {
+    gui->files_need_list = true;
     request_redraw(gui);
 }
 
