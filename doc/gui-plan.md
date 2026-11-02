@@ -5,7 +5,8 @@ desktop GUI: a macOS-inspired sidebar on the left and the device mirror on the
 right, with first-class ADB features (APK install, file transfer, …) and
 drag & drop everywhere.
 
-Status: **M1–M6 implemented, M7 partly** (see Progress). Decisions below were
+Status: **v1 implemented (M1–M7), v2 in progress: app manager done** (see
+Progress). Decisions below were
 settled in a design session (2026-11-02). Change them deliberately, not
 silently.
 
@@ -359,6 +360,36 @@ Not done (follow-ups):
 - Custom unified title bar (borderless + hit testing): replaced by the native
   title bar coloring above; revisit only if needed.
 - Clipboard image copy on Linux/macOS, adb version mismatch warning.
+
+### v2 — App manager (implemented, actions need hands-on)
+
+- Apps page: list with labels, filter User / System / All, search (name or
+  package), refresh. Click selects, double-click opens. Context menu and
+  footer: Open, Force stop, App info on device, Extract APK, Save APK to...,
+  Clear data... and Uninstall... (confirmation; uninstall for user apps only).
+- Listing: the server is pushed to `/data/local/tmp/scrcpy-gui-apps.jar` (not
+  the session's path, so a running session is not affected) and run with
+  `list_apps=true` (~2 s; it deletes itself), parsed by `sc_gui_parse_apps()`.
+  The server only lists launchable apps, so `pm list packages -3` adds the
+  user apps without launcher (named by package). If the server cannot run,
+  the list falls back to package names. No change to the Java server.
+- Open goes through the control channel (`START_APP`, so it opens on the
+  mirrored display, including a new virtual display), with `monkey` as the
+  fallback without control. Other actions: `am force-stop`, `am start
+  APPLICATION_DETAILS_SETTINGS`, `pm clear`, `pm uninstall` (output checked
+  for "Success"). Package names are validated (`sc_gui_is_package_name()`)
+  before reaching the shell.
+- Extract APK: `pm path`, then `adb pull` through the transfer queue to
+  `<folder>/<package>.apk`, or `<folder>/<package>/` for a split app.
+- The list reloads after an install from a drop and after an uninstall.
+- Core touch points: `sc_server_get_path()` (server.c),
+  `sc_screen_start_app()` / `sc_input_manager_start_app()`.
+- Unit tests in `test_gui_util` (server output with CRLF, a long name
+  wrapped on two lines, UTF-8 names, invalid packages; `pm path` output).
+- Verified on device (Android 16): the real server output parses into 141
+  apps (48 system, 3 user apps without launcher); the shell commands for
+  open (monkey), app info, force stop and `pm path` (split APK) behave as
+  expected. Not verified: the page itself, uninstall and clear data.
 
 
 ## Build and test

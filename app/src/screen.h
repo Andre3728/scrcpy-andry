@@ -195,6 +195,10 @@ void
 sc_screen_handle_gui_action(struct sc_screen *screen,
                             enum sc_gui_action action);
 
+// scrcpy-gui: start an app on the device (see sc_input_manager_start_app())
+bool
+sc_screen_start_app(struct sc_screen *screen, const char *name);
+
 // scrcpy-gui: the GUI insets changed (e.g. the sidebar was toggled)
 void
 sc_screen_handle_gui_insets_changed(struct sc_screen *screen);

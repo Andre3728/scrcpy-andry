@@ -52,4 +52,11 @@
 #define SC_ICON_CHEVRON_DOWN       ""
 #define SC_ICON_COPY               ""
 
+#define SC_ICON_PLAY               ""
+#define SC_ICON_OCTAGON_X          ""
+#define SC_ICON_ERASER             ""
+#define SC_ICON_SEARCH             ""
+#define SC_ICON_EXTERNAL_LINK      ""
+#define SC_ICON_PACKAGE_X          ""
+
 #endif

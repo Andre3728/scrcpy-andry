@@ -140,9 +140,108 @@ static void test_shell_quote(void) {
     free(q);
 }
 
+static const struct sc_gui_app_entry *
+find_app(const struct sc_gui_app_list *list, const char *package) {
+    for (size_t i = 0; i < list->count; ++i) {
+        if (!strcmp(list->entries[i].package, package)) {
+            return &list->entries[i];
+        }
+    }
+    return NULL;
+}
+
+static void test_parse_apps(void) {
+    // Output of the server with list_apps=true (format of
+    // LogUtils.buildAppListMessage(), column 30), with CRLF line endings
+    const char *server_out =
+        "[server] INFO: Device: [Google] google Pixel 7 (Android 14)\r\n"
+        "[server] INFO: Processing Android apps... (this may take some "
+        "time)\r\n"
+        "[server] INFO: List of apps:\r\n"
+        " * Camera                         com.android.camera2\r\n"
+        " * Settings                       com.android.settings\r\n"
+        " - My App                         org.example.myapp\r\n"
+        " - A very long application name that overflows\r\n"
+        "                                 org.example.longname\r\n"
+        " - Caf\xC3\xA9                           org.example.cafe\r\n"
+        " - Bad                            not;valid\r\n";
+    const char *user_out =
+        "package:org.example.myapp\r\n"
+        "package:org.example.longname\r\n"
+        "package:org.example.cafe\r\n"
+        "package:org.example.service\r\n";
+
+    struct sc_gui_app_list list = {0};
+    bool ok = sc_gui_parse_apps(server_out, user_out, &list);
+    assert(ok);
+    assert(list.count == 6);
+
+    const struct sc_gui_app_entry *a = find_app(&list, "com.android.camera2");
+    assert(a && !strcmp(a->name, "Camera") && a->system);
+    a = find_app(&list, "com.android.settings");
+    assert(a && !strcmp(a->name, "Settings") && a->system);
+    a = find_app(&list, "org.example.myapp");
+    assert(a && !strcmp(a->name, "My App") && !a->system);
+    a = find_app(&list, "org.example.longname");
+    assert(a && !strcmp(a->name,
+                        "A very long application name that overflows"));
+    a = find_app(&list, "org.example.cafe");
+    assert(a && !strcmp(a->name, "Caf\xC3\xA9"));
+    // A user app without launcher activity: named after its package
+    a = find_app(&list, "org.example.service");
+    assert(a && !strcmp(a->name, "org.example.service") && !a->system);
+    // Invalid package name: ignored
+    assert(!find_app(&list, "not;valid"));
+    sc_gui_app_list_destroy(&list);
+    assert(!list.entries && !list.count);
+
+    // No server output (the server could not run): user packages only
+    ok = sc_gui_parse_apps("", "package:com.foo\npackage:com.bar\n", &list);
+    assert(ok && list.count == 2);
+    assert(!strcmp(list.entries[0].name, "com.foo"));
+    sc_gui_app_list_destroy(&list);
+
+    ok = sc_gui_parse_apps(NULL, NULL, &list);
+    assert(ok && list.count == 0);
+    sc_gui_app_list_destroy(&list);
+}
+
+static void test_is_package_name(void) {
+    assert(sc_gui_is_package_name("com.example.app"));
+    assert(sc_gui_is_package_name("a_b.c1"));
+    assert(!sc_gui_is_package_name(""));
+    assert(!sc_gui_is_package_name("com.example;rm"));
+    assert(!sc_gui_is_package_name("com example"));
+    assert(!sc_gui_is_package_name("1com"));
+}
+
+static void test_parse_pm_lines(void) {
+    // Output of "pm path" for a split APK
+    char **values;
+    size_t count;
+    bool ok = sc_gui_parse_pm_lines(
+        "package:/data/app/~~x==/com.foo-y==/base.apk\r\n"
+        "package:/data/app/~~x==/com.foo-y==/split_config.arm64_v8a.apk\r\n"
+        "\r\n"
+        "garbage\n", &values, &count);
+    assert(ok && count == 2);
+    assert(!strcmp(values[0], "/data/app/~~x==/com.foo-y==/base.apk"));
+    assert(!strcmp(values[1],
+                   "/data/app/~~x==/com.foo-y==/split_config.arm64_v8a.apk"));
+    sc_gui_free_strings(values, count);
+
+    ok = sc_gui_parse_pm_lines("", &values, &count);
+    assert(ok && count == 0);
+    sc_gui_free_strings(values, count);
+}
+
 int main(int argc, char *argv[]) {
     (void) argc;
     (void) argv;
+
+    test_parse_apps();
+    test_is_package_name();
+    test_parse_pm_lines();
 
     test_parse_ls();
     test_shell_quote();

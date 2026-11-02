@@ -172,6 +172,12 @@ struct FileItem {
     }
 };
 
+struct AppItem {
+    std::string name;
+    std::string package;
+    bool system;
+};
+
 struct Transfer {
     uint32_t id;
     sc_gui_transfer_type type;
@@ -280,6 +286,22 @@ struct sc_gui {
     bool open_delete_confirm = false;
     bool open_new_folder = false;
     char new_folder_name[128] = "";
+
+    // App manager
+    std::vector<AppItem> apps; // sorted by name
+    std::string apps_error;
+    bool apps_loading = false;
+    bool apps_need_list = true;
+    bool apps_known = false; // false until the first list
+    char apps_search[128] = "";
+    int apps_filter = 0; // 0: user apps, 1: system apps, 2: all
+    std::string apps_selected; // package
+    std::string apps_context; // package of the context menu
+    bool open_app_context = false;
+    // Confirmation of a destructive action (uninstall, clear data)
+    AppItem app_confirm;
+    sc_gui_app_action app_confirm_action = SC_GUI_APP_UNINSTALL;
+    bool open_app_confirm = false;
 
     bool mirror_focused = false;
     // A mouse button was pressed on the mirror: forward all mouse events to
@@ -1964,15 +1986,381 @@ draw_page_files(sc_gui *gui) {
 }
 
 void
+apps_reset(sc_gui *gui) {
+    gui->apps.clear();
+    gui->apps_error.clear();
+    gui->apps_loading = false;
+    gui->apps_need_list = true;
+    gui->apps_known = false;
+    gui->apps_selected.clear();
+}
+
+const AppItem *
+apps_find(sc_gui *gui, const std::string &package) {
+    for (const AppItem &a : gui->apps) {
+        if (a.package == package) {
+            return &a;
+        }
+    }
+    return nullptr;
+}
+
+// Case-insensitive substring search (ASCII)
+bool
+contains_nocase(const std::string &haystack, const char *needle) {
+    size_t n = strlen(needle);
+    if (!n) {
+        return true;
+    }
+    for (size_t i = 0; i + n <= haystack.size(); ++i) {
+        if (!SDL_strncasecmp(haystack.c_str() + i, needle, n)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool
+app_visible(sc_gui *gui, const AppItem &a) {
+    if ((gui->apps_filter == 0 && a.system)
+            || (gui->apps_filter == 1 && !a.system)) {
+        return false;
+    }
+    return contains_nocase(a.name, gui->apps_search)
+        || contains_nocase(a.package, gui->apps_search);
+}
+
+// The selected app, if it is shown with the current filter and search
+const AppItem *
+apps_find_visible(sc_gui *gui, const std::string &package) {
+    const AppItem *a = apps_find(gui, package);
+    return a && app_visible(gui, *a) ? a : nullptr;
+}
+
+void
+run_app_action(sc_gui *gui, const std::string &package,
+               sc_gui_app_action action) {
+    defer(gui, [gui, package, action] {
+        if (gui->cbs && gui->cbs->on_app_action) {
+            gui->cbs->on_app_action(package.c_str(), action,
+                                    gui->cbs_userdata);
+        }
+    });
+}
+
+void
+extract_apk(sc_gui *gui, const std::string &package, bool choose_folder) {
+    gui->open_transfers = !choose_folder;
+    defer(gui, [gui, package, choose_folder] {
+        if (gui->cbs && gui->cbs->on_extract_apk) {
+            gui->cbs->on_extract_apk(package.c_str(), choose_folder,
+                                     gui->cbs_userdata);
+        }
+    });
+}
+
+void
+ask_app_confirm(sc_gui *gui, const AppItem &app, sc_gui_app_action action) {
+    gui->app_confirm = app;
+    gui->app_confirm_action = action;
+    gui->open_app_confirm = true;
+}
+
+void
+draw_app_row(sc_gui *gui, const AppItem &a, float width) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    float h = gui->s(40);
+
+    ImGui::PushID(a.package.c_str());
+    ImGui::InvisibleButton("##row", ImVec2(width, h));
+    bool hovered = ImGui::IsItemHovered();
+    bool selected = gui->apps_selected == a.package;
+
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+        gui->apps_selected = a.package;
+    }
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+        run_app_action(gui, a.package, SC_GUI_APP_LAUNCH);
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+        gui->apps_selected = a.package;
+        gui->apps_context = a.package;
+        gui->open_app_context = true;
+    }
+    ImGui::SetItemTooltip("%s", a.package.c_str());
+
+    if (selected) {
+        dl->AddRectFilled(pos, pos + ImVec2(width, h), gui->pal.accent,
+                          gui->s(6));
+    } else if (hovered) {
+        dl->AddRectFilled(pos, pos + ImVec2(width, h), gui->pal.hover,
+                          gui->s(6));
+    }
+
+    ImU32 text = selected ? gui->pal.accent_text : gui->pal.text;
+    ImU32 secondary = selected ? (gui->pal.accent_text & 0xC0FFFFFF)
+                               : gui->pal.text_secondary;
+    ImU32 icon_color = selected ? gui->pal.accent_text
+                     : a.system ? gui->pal.text_secondary : gui->pal.accent;
+
+    ImGui::PushFont(nullptr, 20.f);
+    ImVec2 is = ImGui::CalcTextSize(SC_ICON_PACKAGE);
+    dl->AddText(ImVec2(pos.x + gui->s(8), pos.y + (h - is.y) / 2 - gui->s(2)),
+                icon_color, SC_ICON_PACKAGE);
+    ImGui::PopFont();
+
+    float tx = pos.x + gui->s(38);
+    ImVec4 clip(tx, pos.y, pos.x + width - gui->s(6), pos.y + h);
+    float fs = ImGui::GetFontSize();
+    dl->AddText(nullptr, 0, ImVec2(tx, pos.y + gui->s(4)), text,
+                a.name.c_str(), nullptr, 0, &clip);
+    ImGui::PushFont(nullptr, 12.f);
+    dl->AddText(nullptr, 0, ImVec2(tx, pos.y + gui->s(6) + fs), secondary,
+                a.package.c_str(), nullptr, 0, &clip);
+    ImGui::PopFont();
+
+    ImGui::PopID();
+}
+
+// Menu items for an app (context menu)
+void
+draw_app_menu(sc_gui *gui, const AppItem &a) {
+    if (ImGui::Selectable(SC_ICON_PLAY "   Open")) {
+        run_app_action(gui, a.package, SC_GUI_APP_LAUNCH);
+    }
+    if (ImGui::Selectable(SC_ICON_OCTAGON_X "   Force stop")) {
+        run_app_action(gui, a.package, SC_GUI_APP_FORCE_STOP);
+    }
+    if (ImGui::Selectable(SC_ICON_EXTERNAL_LINK "   App info on device")) {
+        run_app_action(gui, a.package, SC_GUI_APP_OPEN_INFO);
+    }
+    ImGui::Separator();
+    if (ImGui::Selectable(SC_ICON_ARROW_DOWN_TO_LINE "   Extract APK")) {
+        extract_apk(gui, a.package, false);
+    }
+    if (ImGui::Selectable(SC_ICON_FOLDER "   Save APK to...")) {
+        extract_apk(gui, a.package, true);
+    }
+    ImGui::Separator();
+    ImGui::PushStyleColor(ImGuiCol_Text, gui->pal.error);
+    if (ImGui::Selectable(SC_ICON_ERASER "   Clear data...")) {
+        ask_app_confirm(gui, a, SC_GUI_APP_CLEAR_DATA);
+    }
+    // System apps cannot be uninstalled (only disabled or reset to the
+    // factory version, which is out of scope)
+    if (ImGui::Selectable(SC_ICON_PACKAGE_X "   Uninstall...", false,
+                          a.system ? ImGuiSelectableFlags_Disabled : 0)) {
+        ask_app_confirm(gui, a, SC_GUI_APP_UNINSTALL);
+    }
+    ImGui::PopStyleColor();
+}
+
+void
+draw_app_modals(sc_gui *gui) {
+    if (gui->open_app_confirm) {
+        ImGui::OpenPopup("##app_confirm");
+        gui->open_app_confirm = false;
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(gui->s(320), 0));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(gui->s(18), gui->s(16)));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, gui->s(12));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, gui->pal.card_bg);
+    if (ImGui::BeginPopupModal("##app_confirm", nullptr,
+                               ImGuiWindowFlags_NoTitleBar
+                                   | ImGuiWindowFlags_AlwaysAutoResize)) {
+        const AppItem &a = gui->app_confirm;
+        bool uninstall = gui->app_confirm_action == SC_GUI_APP_UNINSTALL;
+        char title[256];
+        snprintf(title, sizeof(title),
+                 uninstall ? "Uninstall \"%s\"?" : "Clear the data of \"%s\"?",
+                 a.name.c_str());
+        ImGui::PushTextWrapPos(gui->s(284));
+        text_semibold(gui, title);
+        text_colored(gui->pal.text_secondary, a.package.c_str());
+        ImGui::Dummy(ImVec2(0, gui->s(2)));
+        text_wrapped_colored(gui->pal.text_secondary,
+                             uninstall ? "The app and its data are removed "
+                                         "from the device."
+                                       : "All the files, settings and "
+                                         "accounts of the app are deleted. "
+                                         "This cannot be undone.");
+        ImGui::PopTextWrapPos();
+        ImGui::Dummy(ImVec2(0, gui->s(4)));
+        if (push_button(gui, "Cancel")
+                || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, gui->pal.error);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                              gui->pal.error & 0xE6FFFFFF);
+        ImGui::PushStyleColor(ImGuiCol_Text, rgba(0xFFFFFF));
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,
+                            ImVec2(gui->s(12), gui->s(5)));
+        if (ImGui::Button(uninstall ? "Uninstall" : "Clear data")) {
+            run_app_action(gui, a.package, gui->app_confirm_action);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(2);
+}
+
+void
 draw_page_apps(sc_gui *gui) {
     page_title(gui, "Apps");
-    info_card(gui, "##apps", SC_ICON_PACKAGE, "Install apps",
-              "Drag .apk files onto the device screen to install them. "
-              "Progress and errors are shown in Transfers.");
-    ImGui::Dummy(ImVec2(0, gui->s(4)));
-    if (push_button(gui, SC_ICON_ARROW_DOWN_TO_LINE " Show transfers")) {
-        gui->open_transfers = true;
+
+    if (!is_mirroring(gui)) {
+        info_card(gui, "##apps_none", SC_ICON_PACKAGE, "No device",
+                  "Mirror a device to manage its apps. To install an app, "
+                  "drag .apk files onto the device screen.");
+        return;
     }
+
+    // Request the list when needed
+    if (gui->apps_need_list && !gui->apps_loading) {
+        gui->apps_need_list = false;
+        gui->apps_loading = true;
+        gui->apps_error.clear();
+        defer(gui, [gui] {
+            if (gui->cbs && gui->cbs->on_list_apps) {
+                gui->cbs->on_list_apps(gui->cbs_userdata);
+            }
+        });
+    }
+
+    // Toolbar: refresh, search
+    ImGui::BeginDisabled(gui->apps_loading);
+    if (icon_button(gui, "refresh", SC_ICON_ROTATE_CW, "Refresh")) {
+        gui->apps_need_list = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine(0, gui->s(4));
+    input_text(gui, "##apps_search", SC_ICON_SEARCH "  Search",
+               gui->apps_search, sizeof(gui->apps_search));
+
+    static const char *const filters[] = {"User", "System", "All"};
+    segmented(gui, "apps_filter", filters, 3, &gui->apps_filter);
+
+    const AppItem *selected = apps_find_visible(gui, gui->apps_selected);
+    float footer = selected ? gui->s(40) : gui->s(26);
+
+    // List
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, gui->pal.card_bg);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(gui->s(6), gui->s(6)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, gui->s(2)));
+    ImGui::BeginChild("##apps_list", ImVec2(0, -footer),
+                      ImGuiChildFlags_AlwaysUseWindowPadding);
+
+    if (!gui->apps_known && gui->apps_error.empty()) {
+        spinner(gui, 9, gui->pal.text_secondary);
+        ImGui::SameLine();
+        text_colored(gui->pal.text_secondary, "Loading apps...");
+    } else if (!gui->apps_error.empty()) {
+        text_colored(gui->pal.warning, SC_ICON_TRIANGLE_ALERT);
+        ImGui::SameLine();
+        text_wrapped_colored(gui->pal.text_secondary,
+                             gui->apps_error.c_str());
+    } else {
+        float width = ImGui::GetContentRegionAvail().x;
+        unsigned shown = 0;
+        // Iterate on a copy: a row action may modify the list
+        for (const AppItem &a : std::vector<AppItem>(gui->apps)) {
+            if (app_visible(gui, a)) {
+                draw_app_row(gui, a, width);
+                ++shown;
+            }
+        }
+        if (!shown) {
+            text_colored(gui->pal.text_secondary,
+                         *gui->apps_search ? "No matching apps."
+                                           : "No apps.");
+        }
+    }
+
+    // Click on the empty area: clear the selection
+    if (ImGui::IsWindowHovered() && !ImGui::IsAnyItemHovered()
+            && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        gui->apps_selected.clear();
+    }
+
+    // Context menu (requested by a row, opened outside the row ID scope)
+    if (gui->open_app_context) {
+        ImGui::OpenPopup("##app_context");
+        gui->open_app_context = false;
+    }
+    if (ImGui::BeginPopup("##app_context")) {
+        const AppItem *a = apps_find(gui, gui->apps_context);
+        if (a) {
+            AppItem copy = *a; // the menu may modify the list
+            draw_app_menu(gui, copy);
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+
+    // Footer: actions on the selected app, or the status
+    selected = apps_find_visible(gui, gui->apps_selected);
+    if (selected) {
+        AppItem a = *selected;
+        if (icon_button(gui, "open", SC_ICON_PLAY, "Open")) {
+            run_app_action(gui, a.package, SC_GUI_APP_LAUNCH);
+        }
+        ImGui::SameLine(0, gui->s(2));
+        if (icon_button(gui, "stop", SC_ICON_OCTAGON_X, "Force stop")) {
+            run_app_action(gui, a.package, SC_GUI_APP_FORCE_STOP);
+        }
+        ImGui::SameLine(0, gui->s(2));
+        if (icon_button(gui, "info", SC_ICON_EXTERNAL_LINK,
+                        "App info on device")) {
+            run_app_action(gui, a.package, SC_GUI_APP_OPEN_INFO);
+        }
+        ImGui::SameLine(0, gui->s(2));
+        if (icon_button(gui, "extract", SC_ICON_ARROW_DOWN_TO_LINE,
+                        "Extract APK to the Downloads folder")) {
+            extract_apk(gui, a.package, false);
+        }
+        ImGui::SameLine(0, gui->s(2));
+        ImGui::PushStyleColor(ImGuiCol_Text, gui->pal.error);
+        if (icon_button(gui, "clear", SC_ICON_ERASER, "Clear data...")) {
+            ask_app_confirm(gui, a, SC_GUI_APP_CLEAR_DATA);
+        }
+        if (!a.system) {
+            ImGui::SameLine(0, gui->s(2));
+            if (icon_button(gui, "uninstall", SC_ICON_PACKAGE_X,
+                            "Uninstall...")) {
+                ask_app_confirm(gui, a, SC_GUI_APP_UNINSTALL);
+            }
+        }
+        ImGui::PopStyleColor();
+    } else if (gui->apps_known) {
+        unsigned shown = 0;
+        for (const AppItem &a : gui->apps) {
+            shown += app_visible(gui, a);
+        }
+        char status[64];
+        snprintf(status, sizeof(status), "%u apps", shown);
+        ImGui::AlignTextToFramePadding();
+        text_colored(gui->pal.text_secondary, status);
+        if (gui->apps_loading) {
+            ImGui::SameLine();
+            spinner(gui, 7, gui->pal.text_secondary);
+        }
+    }
+
+    draw_app_modals(gui);
 }
 
 // A setting was edited
@@ -3247,6 +3635,7 @@ sc_gui_set_session(struct sc_gui *gui, enum sc_gui_session_state state,
     std::string new_serial = serial ? serial : "";
     if (new_serial != gui->session_serial || state == SC_GUI_SESSION_NONE) {
         files_reset(gui);
+        apps_reset(gui);
     }
     gui->session = state;
     gui->session_serial = new_serial;
@@ -3401,6 +3790,42 @@ sc_gui_set_recording(struct sc_gui *gui, bool recording) {
 void
 sc_gui_flash(struct sc_gui *gui) {
     gui->flash_until = SDL_GetTicks() + 250;
+    request_redraw(gui);
+}
+
+void
+sc_gui_set_apps(struct sc_gui *gui, const struct sc_gui_package *apps,
+                size_t count, const char *error) {
+    gui->apps_loading = false;
+    if (error) {
+        // Keep the previous list, if any
+        if (!gui->apps_known) {
+            gui->apps_error = error;
+        } else {
+            add_toast(gui, SC_GUI_TOAST_ERROR, error);
+        }
+        request_redraw(gui);
+        return;
+    }
+    gui->apps.clear();
+    for (size_t i = 0; i < count; ++i) {
+        gui->apps.push_back({apps[i].name, apps[i].package, apps[i].system});
+    }
+    std::stable_sort(gui->apps.begin(), gui->apps.end(),
+                     [](const AppItem &a, const AppItem &b) {
+        return SDL_strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+    gui->apps_error.clear();
+    gui->apps_known = true;
+    if (!apps_find(gui, gui->apps_selected)) {
+        gui->apps_selected.clear();
+    }
+    request_redraw(gui);
+}
+
+void
+sc_gui_apps_changed(struct sc_gui *gui) {
+    gui->apps_need_list = true;
     request_redraw(gui);
 }
 

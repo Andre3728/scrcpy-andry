@@ -153,4 +153,9 @@ sc_server_join(struct sc_server *server);
 void
 sc_server_destroy(struct sc_server *server);
 
+// scrcpy-gui: return the path of the server file on the computer (to be
+// freed), or NULL on error
+char *
+sc_server_get_path(void);
+
 #endif

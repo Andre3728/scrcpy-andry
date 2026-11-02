@@ -1276,3 +1276,27 @@ sc_input_manager_handle_gui_action(struct sc_input_manager *im,
             break;
     }
 }
+
+bool
+sc_input_manager_start_app(struct sc_input_manager *im, const char *name) {
+    if (!im->controller || im->camera || im->disconnected) {
+        return false;
+    }
+
+    char *dup = strdup(name);
+    if (!dup) {
+        LOG_OOM();
+        return false;
+    }
+
+    struct sc_control_msg msg;
+    msg.type = SC_CONTROL_MSG_TYPE_START_APP;
+    msg.start_app.name = dup;
+
+    if (!sc_controller_push_msg(im->controller, &msg)) {
+        LOGW("Could not request start app '%s'", name);
+        free(dup);
+        return false;
+    }
+    return true;
+}

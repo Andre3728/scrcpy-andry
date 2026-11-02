@@ -48,4 +48,40 @@ sc_gui_listing_destroy(struct sc_gui_listing *listing);
 char *
 sc_gui_shell_quote(const char *s);
 
+// An app installed on the device
+struct sc_gui_app_entry {
+    char *name;    // label, or the package name if unknown
+    char *package;
+    bool system;
+};
+
+struct sc_gui_app_list {
+    struct sc_gui_app_entry *entries;
+    size_t count;
+};
+
+// Build the list of apps from the output of the server run with
+// list_apps=true (launchable apps, with their labels) and the output of
+// "pm list packages -3" (user apps, including those without launcher
+// activity). Both may be NULL. Return false on allocation failure.
+bool
+sc_gui_parse_apps(const char *server_out, const char *user_packages_out,
+                  struct sc_gui_app_list *list);
+
+void
+sc_gui_app_list_destroy(struct sc_gui_app_list *list);
+
+// Return true if s is a valid Android package name
+bool
+sc_gui_is_package_name(const char *s);
+
+// Parse the "package:<value>" lines printed by "pm list packages" or
+// "pm path". The array and its strings are to be freed with
+// sc_gui_free_strings(). Return false on allocation failure.
+bool
+sc_gui_parse_pm_lines(const char *out, char ***values, size_t *count);
+
+void
+sc_gui_free_strings(char **values, size_t count);
+
 #endif

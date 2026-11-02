@@ -108,6 +108,21 @@ struct sc_gui_file {
     enum sc_gui_file_type type;
 };
 
+// An app installed on the device, for the app manager
+struct sc_gui_package {
+    const char *name; // label (the package name if unknown)
+    const char *package;
+    bool system;
+};
+
+enum sc_gui_app_action {
+    SC_GUI_APP_LAUNCH,
+    SC_GUI_APP_FORCE_STOP,
+    SC_GUI_APP_OPEN_INFO, // open the app info screen on the device
+    SC_GUI_APP_CLEAR_DATA,
+    SC_GUI_APP_UNINSTALL,
+};
+
 enum sc_gui_transfer_state {
     SC_GUI_TRANSFER_PENDING,
     SC_GUI_TRANSFER_RUNNING,
@@ -153,6 +168,15 @@ struct sc_gui_callbacks {
     // folder chosen by the user
     void (*on_pull_files)(const char *const *paths, size_t count,
                           bool choose_folder, void *userdata);
+
+    // App manager
+    void (*on_list_apps)(void *userdata);
+    void (*on_app_action)(const char *package, enum sc_gui_app_action action,
+                          void *userdata);
+    // Download the APK(s) of an app to the computer, in the Downloads folder,
+    // or in a folder chosen by the user
+    void (*on_extract_apk)(const char *package, bool choose_folder,
+                           void *userdata);
 
     // Capture
     void (*on_screenshot)(void *userdata);
@@ -278,6 +302,16 @@ sc_gui_set_listing(struct sc_gui *gui, const char *path,
 // The files on the device changed (delete, new folder): reload the listing
 void
 sc_gui_files_changed(struct sc_gui *gui);
+
+// Set the apps requested by on_list_apps() (the data is copied). error is NULL
+// on success.
+void
+sc_gui_set_apps(struct sc_gui *gui, const struct sc_gui_package *apps,
+                size_t count, const char *error);
+
+// The installed apps changed (install, uninstall): reload the list
+void
+sc_gui_apps_changed(struct sc_gui *gui);
 
 // Show the recording state (the elapsed time is counted from now)
 void

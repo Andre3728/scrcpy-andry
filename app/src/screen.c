@@ -687,6 +687,11 @@ sc_screen_handle_gui_action(struct sc_screen *screen,
     sc_input_manager_handle_gui_action(&screen->im, action);
 }
 
+bool
+sc_screen_start_app(struct sc_screen *screen, const char *name) {
+    return sc_input_manager_start_app(&screen->im, name);
+}
+
 void
 sc_screen_handle_gui_insets_changed(struct sc_screen *screen) {
     struct sc_gui_insets old_insets = screen->gui_insets;

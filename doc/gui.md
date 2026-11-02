@@ -82,6 +82,24 @@ to the computer's Downloads folder. Right-click for **Download**, **Save
 to...** and **Delete**. Ctrl+click selects several files.
 
 
+## Apps
+
+The apps installed on the mirrored device, with their names: **User** apps,
+**System** apps or **All**, and a search field (name or package). Double-click
+an app to open it on the device. Right-click, or use the buttons under the
+list, for:
+
+ - **Open**, **Force stop**, **App info on device**;
+ - **Extract APK** (to the Downloads folder) or **Save APK to...**: a split
+   app is saved as a folder with all its APKs;
+ - **Clear data...** and **Uninstall...** (user apps only), after
+   confirmation.
+
+The names come from the scrcpy server run in its `--list-apps` mode (it lists
+the apps with a launcher icon); user apps without one are listed by package
+name. To install an app, drop `.apk` files on the window.
+
+
 ## Settings
 
 Per-device mirroring settings (resolution, bitrate, frame rate, codec, audio,

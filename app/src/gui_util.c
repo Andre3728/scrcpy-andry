@@ -307,3 +307,224 @@ sc_gui_path_basename(const char *path) {
     }
     return name;
 }
+
+bool
+sc_gui_is_package_name(const char *s) {
+    // Segments of [A-Za-z0-9_] starting with a letter, separated by '.'
+    bool segment_start = true;
+    for (const char *p = s; *p; ++p) {
+        unsigned char c = *p;
+        if (c == '.') {
+            if (segment_start) {
+                return false;
+            }
+            segment_start = true;
+        } else if (isalpha(c) || c == '_' || (isdigit(c) && !segment_start)) {
+            segment_start = false;
+        } else {
+            return false;
+        }
+    }
+    return *s && !segment_start;
+}
+
+// Line [start, end) without the trailing '\r' and blanks
+static const char *
+trim_end(const char *start, const char *end) {
+    while (end > start && (end[-1] == '\r' || is_blank(end[-1]))) {
+        --end;
+    }
+    return end;
+}
+
+static bool
+app_list_add(struct sc_gui_app_list *list, size_t *cap, const char *name,
+             size_t name_len, const char *package, size_t package_len,
+             bool system) {
+    if (list->count == *cap) {
+        size_t new_cap = *cap ? *cap * 2 : 64;
+        struct sc_gui_app_entry *entries =
+            realloc(list->entries, new_cap * sizeof(*entries));
+        if (!entries) {
+            return false;
+        }
+        list->entries = entries;
+        *cap = new_cap;
+    }
+    struct sc_gui_app_entry *e = &list->entries[list->count];
+    e->name = dup_range(name, name_len);
+    e->package = dup_range(package, package_len);
+    e->system = system;
+    if (!e->name || !e->package) {
+        free(e->name);
+        free(e->package);
+        return false;
+    }
+    ++list->count;
+    return true;
+}
+
+static bool
+app_list_contains(const struct sc_gui_app_list *list, const char *package,
+                  size_t len) {
+    for (size_t i = 0; i < list->count; ++i) {
+        const char *p = list->entries[i].package;
+        if (strlen(p) == len && !strncmp(p, package, len)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+is_package_range(const char *s, size_t len) {
+    char buf[256];
+    if (!len || len >= sizeof(buf)) {
+        return false;
+    }
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+    return sc_gui_is_package_name(buf);
+}
+
+bool
+sc_gui_parse_apps(const char *server_out, const char *user_packages_out,
+                  struct sc_gui_app_list *list) {
+    list->entries = NULL;
+    list->count = 0;
+    size_t cap = 0;
+
+    // Server lines: " * <name><padding> <package>" (system app) or " - ..."
+    // (user app). If the name is too long, the package is on the next line,
+    // indented by more than 3 spaces.
+    const char *line = server_out ? server_out : "";
+    while (*line) {
+        const char *eol = line + strcspn(line, "\n");
+        const char *next = *eol ? eol + 1 : eol;
+
+        if (line[0] == ' ' && (line[1] == '*' || line[1] == '-')
+                && line[2] == ' ') {
+            bool system = line[1] == '*';
+            const char *name = line + 3;
+            const char *name_end = trim_end(name, eol);
+            const char *pkg;
+            const char *pkg_end;
+
+            if (!strncmp(next, "    ", 4)) {
+                // Long name: the package is on the next line
+                const char *next_eol = next + strcspn(next, "\n");
+                pkg = next + strspn(next, " \t");
+                pkg_end = trim_end(pkg, next_eol);
+                next = *next_eol ? next_eol + 1 : next_eol;
+            } else {
+                // The package is the last token
+                pkg_end = name_end;
+                pkg = pkg_end;
+                while (pkg > name && !is_blank(pkg[-1])) {
+                    --pkg;
+                }
+                name_end = pkg;
+                while (name_end > name && is_blank(name_end[-1])) {
+                    --name_end;
+                }
+            }
+
+            size_t pkg_len = pkg_end - pkg;
+            if (is_package_range(pkg, pkg_len)
+                    && !app_list_contains(list, pkg, pkg_len)) {
+                if (name_end == name) {
+                    // No label
+                    name = pkg;
+                    name_end = pkg_end;
+                }
+                if (!app_list_add(list, &cap, name, name_end - name, pkg,
+                                  pkg_len, system)) {
+                    sc_gui_app_list_destroy(list);
+                    return false;
+                }
+            }
+        }
+        line = next;
+    }
+
+    // User apps not listed by the server (no launcher activity)
+    char **packages;
+    size_t count;
+    if (!sc_gui_parse_pm_lines(user_packages_out ? user_packages_out : "",
+                               &packages, &count)) {
+        sc_gui_app_list_destroy(list);
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; ok && i < count; ++i) {
+        const char *p = packages[i];
+        size_t len = strlen(p);
+        if (sc_gui_is_package_name(p) && !app_list_contains(list, p, len)) {
+            ok = app_list_add(list, &cap, p, len, p, len, false);
+        }
+    }
+    sc_gui_free_strings(packages, count);
+    if (!ok) {
+        sc_gui_app_list_destroy(list);
+    }
+    return ok;
+}
+
+void
+sc_gui_app_list_destroy(struct sc_gui_app_list *list) {
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->entries[i].name);
+        free(list->entries[i].package);
+    }
+    free(list->entries);
+    list->entries = NULL;
+    list->count = 0;
+}
+
+bool
+sc_gui_parse_pm_lines(const char *out, char ***values, size_t *count) {
+    *values = NULL;
+    *count = 0;
+    size_t cap = 0;
+
+    const char *line = out;
+    while (*line) {
+        const char *eol = line + strcspn(line, "\n");
+        if (!strncmp(line, "package:", 8)) {
+            const char *v = line + 8;
+            const char *v_end = trim_end(v, eol);
+            if (v_end > v) {
+                if (*count == cap) {
+                    size_t new_cap = cap ? cap * 2 : 16;
+                    char **a = realloc(*values, new_cap * sizeof(*a));
+                    if (!a) {
+                        goto error;
+                    }
+                    *values = a;
+                    cap = new_cap;
+                }
+                char *s = dup_range(v, v_end - v);
+                if (!s) {
+                    goto error;
+                }
+                (*values)[(*count)++] = s;
+            }
+        }
+        line = *eol ? eol + 1 : eol;
+    }
+    return true;
+
+error:
+    sc_gui_free_strings(*values, *count);
+    *values = NULL;
+    *count = 0;
+    return false;
+}
+
+void
+sc_gui_free_strings(char **values, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        free(values[i]);
+    }
+    free(values);
+}

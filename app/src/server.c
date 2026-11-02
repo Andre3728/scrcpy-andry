@@ -53,6 +53,11 @@ get_server_path(void) {
     return server_path;
 }
 
+char *
+sc_server_get_path(void) {
+    return get_server_path();
+}
+
 static bool
 push_server(struct sc_intr *intr, const char *serial) {
     char *server_path = get_server_path();

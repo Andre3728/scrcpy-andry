@@ -79,4 +79,9 @@ void
 sc_input_manager_handle_gui_action(struct sc_input_manager *im,
                                    enum sc_gui_action action);
 
+// Start an app on the device (package name). Return false if it could not be
+// requested (no control).
+bool
+sc_input_manager_start_app(struct sc_input_manager *im, const char *name);
+
 #endif

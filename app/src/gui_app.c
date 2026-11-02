@@ -32,8 +32,10 @@
 #include "icon.h"
 #include "screen.h"
 #include "sdl_hints.h"
+#include "server.h"
 #include "shortcut_mod.h"
 #include "util/env.h"
+#include "util/file.h"
 #include "util/intr.h"
 #include "util/log.h"
 #include "util/sdl.h"
@@ -41,6 +43,12 @@
 #include "util/strbuf.h"
 #include "util/thread.h"
 #include "util/tick.h"
+
+#ifdef _WIN32
+# define SC_PATH_SEP "\\"
+#else
+# define SC_PATH_SEP "/"
+#endif
 
 #define SC_GUI_DEVICE_POLL_INTERVAL SC_TICK_FROM_SEC(2)
 #define SC_GUI_TCPIP_PORT 5555
@@ -54,12 +62,19 @@ enum sc_gui_task_type {
     SC_GUI_TASK_LIST_DIR,
     SC_GUI_TASK_DELETE,
     SC_GUI_TASK_MKDIR,
+    // App manager
+    SC_GUI_TASK_LIST_APPS,
+    SC_GUI_TASK_APP_ACTION,
+    SC_GUI_TASK_APK_PATHS,
 };
 
+// Tasks on the device of the current session (files and apps), which do not
+// change the device list
 static bool
 is_file_task(enum sc_gui_task_type type) {
     return type == SC_GUI_TASK_LIST_DIR || type == SC_GUI_TASK_DELETE
-        || type == SC_GUI_TASK_MKDIR;
+        || type == SC_GUI_TASK_MKDIR || type == SC_GUI_TASK_LIST_APPS
+        || type == SC_GUI_TASK_APP_ACTION || type == SC_GUI_TASK_APK_PATHS;
 }
 
 // A device operation executed by the worker thread
@@ -68,14 +83,17 @@ struct sc_gui_task {
     char *serial;  // SWITCH_TO_WIFI
     char *address; // PAIR, CONNECT, DISCONNECT; SWITCH_TO_WIFI (result)
     char *code;    // PAIR
-    char *path;    // LIST_DIR, MKDIR
-    char **paths;  // DELETE
+    char *path;    // LIST_DIR, MKDIR; package for APP_ACTION, APK_PATHS
+    char **paths;  // DELETE; result for APK_PATHS
     size_t path_count;
+    char *dest_dir; // APK_PATHS: local folder to download the APKs to
+    enum sc_gui_app_action app_action; // APP_ACTION
 
     // Result
     bool success;
     const char *error; // static string, may be NULL
     struct sc_gui_listing listing; // LIST_DIR
+    struct sc_gui_app_list apps; // LIST_APPS
     char error_buf[256]; // file tasks
 
     struct sc_gui_task *next;
@@ -265,7 +283,9 @@ sc_gui_task_destroy(struct sc_gui_task *task) {
         free(task->paths[i]);
     }
     free(task->paths);
+    free(task->dest_dir);
     sc_gui_listing_destroy(&task->listing);
+    sc_gui_app_list_destroy(&task->apps);
     free(task);
 }
 
@@ -367,6 +387,117 @@ run_task_mkdir(struct sc_gui_app *app, struct sc_gui_task *task) {
     free(cmd);
 }
 
+// The server is run in "list apps" mode to get the app labels. It is pushed to
+// its own path: the file of a running session must not be replaced. It
+// deletes itself once started.
+#define SC_GUI_DEVICE_LIST_SERVER_PATH "/data/local/tmp/scrcpy-gui-apps.jar"
+#define SC_GUI_APPS_BUFSIZE (1024 * 1024)
+
+static void
+run_task_list_apps(struct sc_gui_app *app, struct sc_gui_task *task) {
+    char *server_out = malloc(SC_GUI_APPS_BUFSIZE);
+    char *user_out = malloc(SC_GUI_APPS_BUFSIZE);
+    if (!server_out || !user_out) {
+        LOG_OOM();
+        free(server_out);
+        free(user_out);
+        return;
+    }
+
+    bool server_ok = false;
+    char *server_path = sc_server_get_path();
+    if (server_path && sc_file_is_regular(server_path)
+            && sc_adb_push(&app->intr, task->serial, server_path,
+                           SC_GUI_DEVICE_LIST_SERVER_PATH, SC_ADB_SILENT)) {
+        const char *const args[] = {
+            "-s", task->serial, "shell",
+            "CLASSPATH=" SC_GUI_DEVICE_LIST_SERVER_PATH, "app_process", "/",
+            "com.genymobile.scrcpy.Server", SCRCPY_VERSION, "list_apps=true",
+            "log_level=info", NULL,
+        };
+        server_ok = sc_adb_run_capture(&app->intr, args, server_out,
+                                       SC_GUI_APPS_BUFSIZE);
+    }
+    free(server_path);
+    if (!server_ok) {
+        LOGW("Could not get the app names from the server");
+    }
+
+    const char *const pm_args[] = {"-s", task->serial, "shell",
+                                   "pm list packages -3", NULL};
+    bool pm_ok = sc_adb_run_capture(&app->intr, pm_args, user_out,
+                                    SC_GUI_APPS_BUFSIZE);
+
+    if (server_ok || pm_ok) {
+        task->success = sc_gui_parse_apps(server_ok ? server_out : NULL,
+                                          pm_ok ? user_out : NULL,
+                                          &task->apps);
+    } else {
+        task->error = "Could not list the apps.";
+    }
+    free(server_out);
+    free(user_out);
+}
+
+static void
+run_task_app_action(struct sc_gui_app *app, struct sc_gui_task *task) {
+    // The package name was validated (sc_gui_is_package_name()), it needs no
+    // quoting
+    const char *pkg = task->path;
+    char cmd[512];
+    switch (task->app_action) {
+        case SC_GUI_APP_LAUNCH:
+            // Fallback when there is no control channel
+            snprintf(cmd, sizeof(cmd), "monkey -p %s -c "
+                     "android.intent.category.LAUNCHER 1", pkg);
+            break;
+        case SC_GUI_APP_FORCE_STOP:
+            snprintf(cmd, sizeof(cmd), "am force-stop %s", pkg);
+            break;
+        case SC_GUI_APP_OPEN_INFO:
+            snprintf(cmd, sizeof(cmd), "am start -a "
+                     "android.settings.APPLICATION_DETAILS_SETTINGS "
+                     "-d package:%s", pkg);
+            break;
+        case SC_GUI_APP_CLEAR_DATA:
+            snprintf(cmd, sizeof(cmd), "pm clear %s", pkg);
+            break;
+        case SC_GUI_APP_UNINSTALL:
+            snprintf(cmd, sizeof(cmd), "pm uninstall %s", pkg);
+            break;
+        default:
+            assert(!"unexpected app action");
+            return;
+    }
+
+    char out[4096];
+    bool ok = run_shell(app, task->serial, cmd, out, sizeof(out));
+    if (task->app_action == SC_GUI_APP_CLEAR_DATA
+            || task->app_action == SC_GUI_APP_UNINSTALL) {
+        // Old versions return 0 on failure
+        ok = ok && strstr(out, "Success");
+    } else if (task->app_action != SC_GUI_APP_FORCE_STOP) {
+        // am and monkey may return 0 on failure
+        ok = ok && !strstr(out, "Error") && !strstr(out, "aborted");
+    }
+    task->success = ok;
+    if (!ok) {
+        sc_gui_adb_error(out, task->error_buf, sizeof(task->error_buf));
+        LOGW("App action failed (%s): %s", cmd, out);
+    }
+}
+
+static void
+run_task_apk_paths(struct sc_gui_app *app, struct sc_gui_task *task) {
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd), "pm path %s", task->path);
+    char out[16384];
+    if (run_shell(app, task->serial, cmd, out, sizeof(out))
+            && sc_gui_parse_pm_lines(out, &task->paths, &task->path_count)) {
+        task->success = task->path_count > 0;
+    }
+}
+
 static void
 run_task_switch_to_wifi(struct sc_gui_app *app, struct sc_gui_task *task) {
     struct sc_intr *intr = &app->intr;
@@ -441,6 +572,15 @@ run_task(struct sc_gui_app *app, struct sc_gui_task *task) {
             break;
         case SC_GUI_TASK_MKDIR:
             run_task_mkdir(app, task);
+            break;
+        case SC_GUI_TASK_LIST_APPS:
+            run_task_list_apps(app, task);
+            break;
+        case SC_GUI_TASK_APP_ACTION:
+            run_task_app_action(app, task);
+            break;
+        case SC_GUI_TASK_APK_PATHS:
+            run_task_apk_paths(app, task);
             break;
     }
 }
@@ -758,10 +898,11 @@ add_job(struct sc_gui_app *app, struct sc_gui_transfer_job *job,
     sc_mutex_unlock(&app->mutex);
 }
 
-// Download a file or folder from the device into local_dir
+// Download a file or folder from the device to local (a folder, or the
+// destination file). name is shown in Transfers (NULL: the remote name).
 static void
-enqueue_pull(struct sc_gui_app *app, const char *remote,
-             const char *local_dir) {
+enqueue_pull(struct sc_gui_app *app, const char *remote, const char *local,
+             const char *name) {
     if (!app->session_serial) {
         return;
     }
@@ -773,7 +914,7 @@ enqueue_pull(struct sc_gui_app *app, const char *remote,
     job->id = ++app->next_transfer_id;
     job->type = SC_GUI_TRANSFER_PULL;
     job->serial = strdup(app->session_serial);
-    job->local = strdup(local_dir);
+    job->local = strdup(local);
     job->remote_dir = strdup(remote);
     if (!job->serial || !job->local || !job->remote_dir) {
         LOG_OOM();
@@ -781,14 +922,19 @@ enqueue_pull(struct sc_gui_app *app, const char *remote,
         return;
     }
 
-    // Name: last component, without the trailing '/'
-    char name[256];
-    snprintf(name, sizeof(name), "%s", remote);
-    size_t len = strlen(name);
-    while (len > 1 && name[len - 1] == '/') {
-        name[--len] = '\0';
+    if (name) {
+        add_job(app, job, name);
+        return;
     }
-    add_job(app, job, sc_gui_path_basename(name));
+
+    // Name: last component, without the trailing '/'
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", remote);
+    size_t len = strlen(buf);
+    while (len > 1 && buf[len - 1] == '/') {
+        buf[--len] = '\0';
+    }
+    add_job(app, job, sc_gui_path_basename(buf));
 }
 
 static const char *
@@ -804,6 +950,7 @@ get_downloads_folder(void) {
 struct sc_gui_pull_request {
     char **paths;
     size_t count;
+    char *package; // extract the APKs of this app instead of pulling paths
     char *dir; // set by the dialog callback
 };
 
@@ -813,6 +960,7 @@ sc_gui_pull_request_destroy(struct sc_gui_pull_request *req) {
         free(req->paths[i]);
     }
     free(req->paths);
+    free(req->package);
     free(req->dir);
     free(req);
 }
@@ -846,6 +994,7 @@ on_transfer_update(struct sc_gui_app *app, struct sc_gui_transfer_update *u) {
         if (u->state == SC_GUI_TRANSFER_DONE) {
             if (u->type == SC_GUI_TRANSFER_INSTALL) {
                 ++app->batch_installed;
+                sc_gui_apps_changed(app->gui);
             } else {
                 // copies and downloads
                 ++app->batch_copied;
@@ -1189,6 +1338,111 @@ on_devices(struct sc_gui_app *app, struct sc_vec_adb_devices *vec) {
 }
 
 static void
+on_apps_listed(struct sc_gui_app *app, struct sc_gui_task *task) {
+    struct sc_gui_app_list *l = &task->apps;
+    struct sc_gui_package *apps =
+        l->count ? calloc(l->count, sizeof(*apps)) : NULL;
+    if (l->count && !apps) {
+        LOG_OOM();
+        return;
+    }
+    for (size_t i = 0; i < l->count; ++i) {
+        apps[i].name = l->entries[i].name;
+        apps[i].package = l->entries[i].package;
+        apps[i].system = l->entries[i].system;
+    }
+    const char *error = NULL;
+    if (!task->success) {
+        error = task->error ? task->error : "Could not list the apps.";
+    }
+    sc_gui_set_apps(app->gui, apps, l->count, error);
+    free(apps);
+}
+
+static void
+on_app_action_done(struct sc_gui_app *app, struct sc_gui_task *task) {
+    char msg[384];
+    const char *pkg = task->path;
+    if (!task->success) {
+        const char *what;
+        switch (task->app_action) {
+            case SC_GUI_APP_LAUNCH: what = "Could not open"; break;
+            case SC_GUI_APP_FORCE_STOP: what = "Could not stop"; break;
+            case SC_GUI_APP_OPEN_INFO: what = "Could not open the info of";
+                                       break;
+            case SC_GUI_APP_CLEAR_DATA: what = "Could not clear the data of";
+                                        break;
+            default: what = "Could not uninstall"; break;
+        }
+        snprintf(msg, sizeof(msg), "%s %s: %s", what, pkg,
+                 task->error_buf[0] ? task->error_buf : "error");
+        sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR, msg);
+        return;
+    }
+
+    switch (task->app_action) {
+        case SC_GUI_APP_FORCE_STOP:
+            snprintf(msg, sizeof(msg), "Stopped %s.", pkg);
+            sc_gui_show_toast(app->gui, SC_GUI_TOAST_INFO, msg);
+            break;
+        case SC_GUI_APP_CLEAR_DATA:
+            snprintf(msg, sizeof(msg), "Cleared the data of %s.", pkg);
+            sc_gui_show_toast(app->gui, SC_GUI_TOAST_SUCCESS, msg);
+            break;
+        case SC_GUI_APP_UNINSTALL:
+            snprintf(msg, sizeof(msg), "Uninstalled %s.", pkg);
+            sc_gui_show_toast(app->gui, SC_GUI_TOAST_SUCCESS, msg);
+            sc_gui_apps_changed(app->gui);
+            break;
+        default:
+            break;
+    }
+}
+
+static void
+on_apk_paths(struct sc_gui_app *app, struct sc_gui_task *task) {
+    const char *pkg = task->path;
+    if (!task->success) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "Could not find the APK of %s.", pkg);
+        sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR, msg);
+        return;
+    }
+
+    // The folder may or may not end with a separator
+    const char *dir = task->dest_dir;
+    size_t dir_len = strlen(dir);
+    bool has_sep = dir_len && (dir[dir_len - 1] == '/'
+                            || dir[dir_len - 1] == '\\');
+    const char *sep = has_sep ? "" : SC_PATH_SEP;
+
+    char local[1024];
+    char name[512];
+    if (task->path_count == 1) {
+        // <dir>/<package>.apk
+        snprintf(local, sizeof(local), "%s%s%s.apk", dir, sep, pkg);
+        snprintf(name, sizeof(name), "%s.apk", pkg);
+        enqueue_pull(app, task->paths[0], local, name);
+        return;
+    }
+
+    // Split APK: <dir>/<package>/{base.apk, split_*.apk}
+    snprintf(local, sizeof(local), "%s%s%s", dir, sep, pkg);
+    if (!SDL_CreateDirectory(local)) {
+        char msg[1200];
+        snprintf(msg, sizeof(msg), "Could not create %s: %s", local,
+                 SDL_GetError());
+        sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR, msg);
+        return;
+    }
+    for (size_t i = 0; i < task->path_count; ++i) {
+        snprintf(name, sizeof(name), "%s/%s", pkg,
+                 sc_gui_path_basename(task->paths[i]));
+        enqueue_pull(app, task->paths[i], local, name);
+    }
+}
+
+static void
 on_file_task_done(struct sc_gui_app *app, struct sc_gui_task *task) {
     switch (task->type) {
         case SC_GUI_TASK_LIST_DIR: {
@@ -1229,6 +1483,15 @@ on_file_task_done(struct sc_gui_app *app, struct sc_gui_task *task) {
                 sc_gui_show_toast(app->gui, SC_GUI_TOAST_ERROR, msg);
             }
             sc_gui_files_changed(app->gui);
+            break;
+        case SC_GUI_TASK_LIST_APPS:
+            on_apps_listed(app, task);
+            break;
+        case SC_GUI_TASK_APP_ACTION:
+            on_app_action_done(app, task);
+            break;
+        case SC_GUI_TASK_APK_PATHS:
+            on_apk_paths(app, task);
             break;
         default:
             assert(!"unexpected task");
@@ -1293,6 +1556,24 @@ on_task_done(struct sc_gui_app *app, struct sc_gui_task *task) {
     request_refresh(app);
 }
 
+// Find the APK(s) of an app, then download them to local_dir
+static void
+submit_extract_apk(struct sc_gui_app *app, const char *package,
+                   const char *local_dir) {
+    struct sc_gui_task *task =
+        new_file_task(app, SC_GUI_TASK_APK_PATHS, package);
+    if (!task) {
+        return;
+    }
+    task->dest_dir = strdup(local_dir);
+    if (!task->dest_dir) {
+        LOG_OOM();
+        sc_gui_task_destroy(task);
+        return;
+    }
+    enqueue_task(app, task);
+}
+
 // Handle the events owned by the app. Return true if consumed.
 static bool
 handle_app_event(struct sc_gui_app *app, const SDL_Event *event) {
@@ -1308,8 +1589,11 @@ handle_app_event(struct sc_gui_app *app, const SDL_Event *event) {
             return true;
         case SC_EVENT_GUI_FOLDER_CHOSEN: {
             struct sc_gui_pull_request *req = event->user.data1;
+            if (req->package) {
+                submit_extract_apk(app, req->package, req->dir);
+            }
             for (size_t i = 0; i < req->count; ++i) {
-                enqueue_pull(app, req->paths[i], req->dir);
+                enqueue_pull(app, req->paths[i], req->dir, NULL);
             }
             sc_gui_pull_request_destroy(req);
             return true;
@@ -1320,12 +1604,6 @@ handle_app_event(struct sc_gui_app *app, const SDL_Event *event) {
 }
 
 // ------------------------------------------------------------------ capture
-
-#ifdef _WIN32
-# define SC_PATH_SEP "\\"
-#else
-# define SC_PATH_SEP "/"
-#endif
 
 // Return "<user folder>/scrcpy/<prefix>_YYYYMMDD_HHMMSS.<ext>" (to be freed),
 // creating the scrcpy folder if needed
@@ -1618,7 +1896,7 @@ cb_on_pull_files(const char *const *paths, size_t count, bool choose_folder,
     if (!choose_folder) {
         const char *dir = get_downloads_folder();
         for (size_t i = 0; i < count; ++i) {
-            enqueue_pull(app, paths[i], dir);
+            enqueue_pull(app, paths[i], dir, NULL);
         }
         return;
     }
@@ -1642,6 +1920,69 @@ cb_on_pull_files(const char *const *paths, size_t count, bool choose_folder,
             return;
         }
         req->count = i + 1;
+    }
+    SDL_ShowOpenFolderDialog(on_folder_chosen, req, app->window,
+                             get_downloads_folder(), false);
+}
+
+static void
+cb_on_list_apps(void *userdata) {
+    struct sc_gui_app *app = userdata;
+    struct sc_gui_task *task = new_file_task(app, SC_GUI_TASK_LIST_APPS, NULL);
+    if (task) {
+        enqueue_task(app, task);
+    } else {
+        sc_gui_set_apps(app->gui, NULL, 0, "No device");
+    }
+}
+
+static void
+cb_on_app_action(const char *package, enum sc_gui_app_action action,
+                 void *userdata) {
+    struct sc_gui_app *app = userdata;
+    if (!sc_gui_is_package_name(package)) {
+        // Never pass an unexpected string to the device shell
+        LOGE("Invalid package name: %s", package);
+        return;
+    }
+
+    if (action == SC_GUI_APP_LAUNCH && app->screen
+            && sc_screen_start_app(app->screen, package)) {
+        // Started through the control channel (on the mirrored display)
+        return;
+    }
+
+    struct sc_gui_task *task =
+        new_file_task(app, SC_GUI_TASK_APP_ACTION, package);
+    if (task) {
+        task->app_action = action;
+        enqueue_task(app, task);
+    }
+}
+
+static void
+cb_on_extract_apk(const char *package, bool choose_folder, void *userdata) {
+    struct sc_gui_app *app = userdata;
+    if (!sc_gui_is_package_name(package)) {
+        LOGE("Invalid package name: %s", package);
+        return;
+    }
+
+    if (!choose_folder) {
+        submit_extract_apk(app, package, get_downloads_folder());
+        return;
+    }
+
+    struct sc_gui_pull_request *req = calloc(1, sizeof(*req));
+    if (!req) {
+        LOG_OOM();
+        return;
+    }
+    req->package = strdup(package);
+    if (!req->package) {
+        LOG_OOM();
+        free(req);
+        return;
     }
     SDL_ShowOpenFolderDialog(on_folder_chosen, req, app->window,
                              get_downloads_folder(), false);
@@ -2021,6 +2362,9 @@ scrcpy_gui(struct scrcpy_options *options) {
         .on_delete_files = cb_on_delete_files,
         .on_create_dir = cb_on_create_dir,
         .on_pull_files = cb_on_pull_files,
+        .on_list_apps = cb_on_list_apps,
+        .on_app_action = cb_on_app_action,
+        .on_extract_apk = cb_on_extract_apk,
         .on_screenshot = cb_on_screenshot,
         .on_toggle_recording = cb_on_toggle_recording,
     };
